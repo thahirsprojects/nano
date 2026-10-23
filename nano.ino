@@ -15,7 +15,12 @@
 //    S|name|HH:MM start|HH:MM end|water minutes  change settings
 //    M|title|artist|PLAYING/PAUSED/STOPPED        music metadata
 //    W                                            test the water screen
-//    NANO -> PHONE notifications: C|NEXT, C|PREV, C|PLAYPAUSE
+//    E|<0-3>                                      eye style (normal/happy/surprised/angry)
+//    F                                            find me: flash the screen
+//  NANO -> PHONE (BLE notify on the same characteristic):
+//    C|NEXT, C|PREV, C|PLAYPAUSE                  music controls
+//    H|WATER                                      water reminder tapped away
+//    E|<0-3>                                      eye style changed by double tap
 //
 //  WIRING (unchanged):
 //    OLED VCC->3V3 GND->GND SCK->P22 SDA->P21
@@ -60,17 +65,22 @@ const unsigned long HOLD_MS       = 600;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 Preferences prefs;
 
-enum Mode { EYES, CLOCK, WATER, NOTIFY, NOTIFYFULL, MUSIC };
+enum Mode { EYES, CLOCK, WATER, NOTIFY, NOTIFYFULL, MUSIC, FIND };
 Mode mode = EYES;
 unsigned long modeStart = 0;
 String notifyApp = "", notifyFull = "";
 
 // Compact music metadata. The OLED shows at most 3 title words and 2 artist words.
 String musicTitle = "", musicArtist = "", musicState = "STOPPED";
+unsigned long musicPausedAt = 0;
+const unsigned long MUSIC_PAUSE_TIMEOUT_MS = 30000;   // paused music screen -> eyes
+const unsigned long FIND_MS = 8000;
 
 enum Mood { NORMAL, HAPPY, ANGRY, SURPRISED, TIRED, SLEEP };
 int mood = NORMAL;
 int activeMood = NORMAL;            // cute-hours expression; double tap changes it
+const int MOOD_ORDER[] = { NORMAL, HAPPY, SURPRISED, ANGRY };   // index = eye style sent by the phone
+int moodPick = 0;
 
 float openL = 1, openR = 1, openCur = 1.0;
 unsigned long nextBlink = 0, blinkStart = 0;
@@ -92,13 +102,15 @@ unsigned long lastWater = 0;
 
 // ---- BLE state ----
 volatile bool phoneConnected = false;
-String cmdQ[4];                       // small queue: BLE task -> loop()
+bool wasConnected = false;
+#define CMD_Q_SIZE 16                 // phone sends T, S, E and M together on connect
+String cmdQ[CMD_Q_SIZE];              // queue: BLE task -> loop() (one producer, one consumer)
 volatile int qHead = 0, qTail = 0;
 BLECharacteristic* nanoCharacteristic = nullptr;
 bool musicLongTriggered = false;
 
 void pushCmd(const String &s) {
-  int n = (qHead + 1) % 4;
+  int n = (qHead + 1) % CMD_Q_SIZE;
   if (n == qTail) return;             // queue full, drop
   cmdQ[qHead] = s;
   qHead = n;
@@ -120,14 +132,19 @@ void loadSettings() {
   actStart  = prefs.getInt("as", 9 * 60);
   actEnd    = prefs.getInt("ae", 17 * 60 + 30);
   waterMin  = prefs.getInt("wm", 20);
+  if (buddyName.length() == 0) buddyName = "Nano";
+  if (actStart < 0 || actStart >= 24 * 60) actStart = 9 * 60;
+  if (actEnd < 0 || actEnd >= 24 * 60) actEnd = 17 * 60 + 30;
+  if (waterMin < 1 || waterMin > 240) waterMin = 20;
   applyWater();
 }
 
+// The phone resends settings on every connect; only write flash when they change.
 void saveSettings() {
-  prefs.putString("name", buddyName);
-  prefs.putInt("as", actStart);
-  prefs.putInt("ae", actEnd);
-  prefs.putInt("wm", waterMin);
+  if (prefs.getString("name", "") != buddyName) prefs.putString("name", buddyName);
+  if (prefs.getInt("as", -1) != actStart) prefs.putInt("as", actStart);
+  if (prefs.getInt("ae", -1) != actEnd) prefs.putInt("ae", actEnd);
+  if (prefs.getInt("wm", -1) != waterMin) prefs.putInt("wm", waterMin);
 }
 
 void drawHeart(int cx, int cy, int s) {
@@ -158,7 +175,7 @@ class RxCB : public BLECharacteristicCallbacks {
 
 void startBLE() {
   BLEDevice::init("Nano");
-  BLEDevice::setMTU(185);             // room for a full notification in one write
+  BLEDevice::setMTU(517);             // room for a full notification in one write
   BLEServer* server = BLEDevice::createServer();
   server->setCallbacks(new ServerCB());
   BLEService* svc = server->createService(SERVICE_UUID);
@@ -189,9 +206,10 @@ void bootScreen() {
   }
   display.clearDisplay();
   display.setTextSize(1); display.setCursor(30, 14); display.print("Hi, I am");
-  display.setTextSize(3);
-  int w = buddyName.length() * 18;
-  display.setCursor((128 - w) / 2, 32);
+  int size = (buddyName.length() * 18 <= 128) ? 3 : 2;   // 8 letters do not fit at size 3
+  display.setTextSize(size);
+  int w = buddyName.length() * 6 * size;
+  display.setCursor(max(0, (128 - w) / 2), 32);
   display.print(buddyName);
   display.display();
   delay(2000);
@@ -228,13 +246,30 @@ String compactWords(String input, int maxWords, int maxChars) {
   return out;
 }
 
-void sendMediaControl(const char* action) {
+// The OLED font only has ASCII; drop any other UTF-8 bytes so they don't
+// show up as random symbols.
+String asciiOnly(const String &in) {
+  String out;
+  out.reserve(in.length());
+  for (unsigned int i = 0; i < in.length(); ++i) {
+    unsigned char ch = (unsigned char)in.charAt(i);
+    if (ch >= 32 && ch < 127) out += (char)ch;
+    else if (ch == '\t') out += ' ';
+  }
+  return out;
+}
+
+// Raw bytes work with both the 2.x (std::string) and 3.x (String) BLE libraries.
+void sendToPhone(const String &payload) {
   if (!phoneConnected || nanoCharacteristic == nullptr) return;
-  String payload = String("C|") + action;
-  nanoCharacteristic->setValue(payload);
+  nanoCharacteristic->setValue((uint8_t*)payload.c_str(), payload.length());
   nanoCharacteristic->notify();
   Serial.print("BLE notify: ");
   Serial.println(payload);
+}
+
+void sendMediaControl(const char* action) {
+  sendToPhone(String("C|") + action);
 }
 
 void drawMusic(unsigned long now) {
@@ -310,7 +345,11 @@ bool getNow(struct tm &ti) {
 int minutesNow() { struct tm ti; if (!getNow(ti)) return -1; return ti.tm_hour * 60 + ti.tm_min; }
 bool isBirthday() { struct tm ti; if (!getNow(ti)) return false; return (ti.tm_mon + 1 == BDAY_MONTH) && (ti.tm_mday == BDAY_DAY); }
 bool isSleepHours() { int m = minutesNow(); if (m < 0) return false; return (m >= SLEEP_START || m < SLEEP_END); }
-bool activeHours() { int m = minutesNow(); if (m < 0) return true; return (m >= actStart && m < actEnd); }
+bool activeHours() {
+  int m = minutesNow(); if (m < 0) return true;
+  if (actStart <= actEnd) return (m >= actStart && m < actEnd);
+  return (m >= actStart || m < actEnd);        // range crosses midnight
+}
 
 void setClock(long utc, long tz) {
   struct timeval tv;
@@ -418,7 +457,9 @@ void updateEyes(unsigned long now) {
   else if (special == SP_WINK)  openR = 0.12;
   else if (special == SP_YAWN)  { float p = (now - specialStart) / 1300.0;
                                   float yo = (p < 0.5) ? (1.0 - p * 1.6) : (0.2 + (p - 0.5) * 1.6);
-                                  if (yo > 1) yo = 1; if (yo < 0.15) yo = 0.15; openL = openR = yo; }
+                                  if (yo > 1) yo = 1;
+                                  if (yo < 0.15) yo = 0.15;
+                                  openL = openR = yo; }
   else if (special == SP_HEART) heart = true;
 
   if (special != SP_ROLL) { lookX += (lookTX - lookX) * 0.2; lookY += (lookTY - lookY) * 0.2; }
@@ -626,6 +667,22 @@ bool showNotifyFull(unsigned long now) {
   return (now - modeStart) > 12000;          // auto-close after 12s
 }
 
+// "find my Nano": big surprised eyes, flashing screen
+bool showFind(unsigned long now) {
+  unsigned long el = now - modeStart;
+  display.clearDisplay();
+  drawEye(36, 26, 1.0, SURPRISED, true);
+  drawEye(92, 26, 1.0, SURPRISED, false);
+  display.setTextSize(1);
+  const char* msg = "Here I am!";
+  display.setCursor((128 - (int)strlen(msg) * 6) / 2, 54);
+  display.print(msg);
+  setInverted((el / 300) % 2 == 1);
+  display.display();
+  if (el > FIND_MS) { setInverted(false); return true; }
+  return false;
+}
+
 void showBirthday(unsigned long now) {
   float t = (now % 2000) / 2000.0;
   display.clearDisplay();
@@ -651,6 +708,29 @@ void showBirthday(unsigned long now) {
 // ===============================================================
 //  Commands from the phone
 // ===============================================================
+// Where to go when a temporary screen (clock, notification, water...) ends.
+Mode homeMode() {
+  return (musicState == "PLAYING") ? MUSIC : EYES;
+}
+
+// Music only takes over idle screens, never a notification or reminder.
+bool canShowMusic() {
+  return mode == EYES || mode == CLOCK || mode == MUSIC;
+}
+
+void setEyeStyle(int pick) {
+  if (pick < 0 || pick > 3) return;
+  moodPick = pick;
+  activeMood = MOOD_ORDER[pick];
+}
+
+bool screenInverted = false;
+void setInverted(bool on) {
+  if (on == screenInverted) return;
+  screenInverted = on;
+  display.invertDisplay(on);
+}
+
 void handleCommand(String c) {
   c.trim();
   if (c.length() < 1) return;
@@ -665,15 +745,16 @@ void handleCommand(String c) {
     if (utc > 1577836800L) setClock(utc, tz);
 
   } else if (type == 'N') {                       // N|App|message
+    rest = asciiOnly(rest);
     int bar = rest.indexOf('|');
     if (bar >= 0) { notifyApp = rest.substring(0, bar); notifyFull = rest.substring(bar + 1); }
     else          { notifyApp = rest; notifyFull = rest; }
     notifyApp.trim(); notifyFull.trim();
     notifyFull = notifyFull.substring(0, 110);
-    mode = NOTIFY; modeStart = millis();
+    mode = NOTIFY; modeStart = millis(); pendingTap = false;
 
   } else if (type == 'S') {                       // S|name|HH:MM|HH:MM|minutes
-    String parts[4]; int n = 0; String r = rest;
+    String parts[4]; int n = 0; String r = asciiOnly(rest);
     while (n < 4) {
       int b = r.indexOf('|');
       if (b < 0) { parts[n++] = r; break; }
@@ -681,8 +762,8 @@ void handleCommand(String c) {
       r = r.substring(b + 1);
     }
     if (n >= 1) { parts[0].trim(); if (parts[0].length()) buddyName = parts[0].substring(0, 8); }
-    if (n >= 2) { int v = parseHHMM(parts[1]); if (v >= 0) actStart = v; }
-    if (n >= 3) { int v = parseHHMM(parts[2]); if (v >= 0) actEnd = v; }
+    if (n >= 2) { int v = parseHHMM(parts[1]); if (v >= 0 && v < 24 * 60) actStart = v; }
+    if (n >= 3) { int v = parseHHMM(parts[2]); if (v >= 0 && v < 24 * 60) actEnd = v; }
     if (n >= 4) { int w = parts[3].toInt(); if (w >= 1 && w <= 240) waterMin = w; }
     applyWater();
     saveSettings();
@@ -690,35 +771,47 @@ void handleCommand(String c) {
   } else if (type == 'M') {                       // M|title|artist|PLAYING/PAUSED/STOPPED
     String fields[3];
     int n = 0;
-    String r = rest;
+    String r = asciiOnly(rest);
     while (n < 3) {
       int b = r.indexOf('|');
       if (b < 0) { fields[n++] = r; break; }
       fields[n++] = r.substring(0, b);
       r = r.substring(b + 1);
     }
+    String oldTitle = musicTitle, oldState = musicState;
     if (n >= 1) musicTitle = compactWords(fields[0], 3, 20);
     if (n >= 2) musicArtist = compactWords(fields[1], 2, 18);
     if (n >= 3) { fields[2].trim(); fields[2].toUpperCase(); musicState = fields[2]; }
+    if (musicState != "PLAYING" && musicState != "PAUSED") musicState = "STOPPED";
+    bool changed = (musicTitle != oldTitle) || (musicState != oldState);
+
     if (musicState == "STOPPED") {
-      mode = EYES;
-      pendingTap = false;
-    } else {
+      if (mode == MUSIC) mode = EYES;
+    } else if (musicState == "PAUSED") {
+      if (oldState != "PAUSED") musicPausedAt = millis();   // music screen times out later
+    } else if (changed && canShowMusic() && mode != MUSIC) {
       mode = MUSIC;
       modeStart = millis();
       pendingTap = false;
       musicLongTriggered = false;
     }
+
   } else if (type == 'W') {                       // test water screen
-    mode = WATER; modeStart = millis();
+    mode = WATER; modeStart = millis(); pendingTap = false;
+
+  } else if (type == 'E') {                       // E|0..3 eye style
+    if (rest.length()) setEyeStyle(rest.toInt());
+
+  } else if (type == 'F') {                       // find my Nano
+    mode = FIND; modeStart = millis(); pendingTap = false;
   }
 }
 
 // ===============================================================
 void onSingleTap() { mode = CLOCK; modeStart = millis(); }
 void onDoubleTap() {
-  const int order[] = { NORMAL, HAPPY, SURPRISED, ANGRY };
-  static int pick = 0; pick = (pick + 1) % 4; activeMood = order[pick];
+  setEyeStyle((moodPick + 1) % 4);
+  sendToPhone(String("E|") + moodPick);           // keep the app's picker in sync
 }
 
 void loop() {
@@ -727,9 +820,17 @@ void loop() {
   // commands that arrived over Bluetooth
   while (qTail != qHead) {
     String c = cmdQ[qTail];
-    qTail = (qTail + 1) % 4;
+    qTail = (qTail + 1) % CMD_Q_SIZE;
     handleCommand(c);
   }
+
+  // phone went away: its music info is stale now
+  bool connectedNow = phoneConnected;
+  if (wasConnected && !connectedNow) {
+    musicState = "STOPPED";
+    if (mode == MUSIC) mode = EYES;
+  }
+  wasConnected = connectedNow;
 
   bool touch = digitalRead(TOUCH_PIN);
   bool rising = (touch && !lastTouch);
@@ -768,8 +869,12 @@ void loop() {
         lastTapTime = now;
       }
     } else if (mode == NOTIFY) { mode = NOTIFYFULL; modeStart = now; pendingTap = false; }
-    else if (mode == NOTIFYFULL) { notifyApp = ""; notifyFull = ""; mode = EYES; pendingTap = false; }
-    else if (mode != EYES) { if (mode == WATER) lastWater = now; mode = EYES; pendingTap = false; }
+    else if (mode == NOTIFYFULL) { notifyApp = ""; notifyFull = ""; mode = homeMode(); pendingTap = false; }
+    else if (mode == WATER) {                     // tapped away = "I drank" -> phone counts it
+      lastWater = now; mode = homeMode(); pendingTap = false;
+      sendToPhone("H|WATER");
+    }
+    else if (mode != EYES) { mode = homeMode(); pendingTap = false; }
     else {
       if (pendingTap && (now - lastTapTime <= DOUBLE_TAP_MS)) { pendingTap = false; onDoubleTap(); }
       else { pendingTap = true; lastTapTime = now; }
@@ -784,14 +889,23 @@ void loop() {
   lastTouch = touch;
 
   // ---- screens ----
-  if (mode == MUSIC)  { drawMusic(now); delay(35); return; }
-  if (mode == CLOCK)  { showClock(); if (now - modeStart > 5000) mode = EYES; delay(30); return; }
-  if (mode == WATER)  { showWater(now); if (now - modeStart > 20000) { mode = EYES; lastWater = now; } delay(30); return; }
-  if (mode == NOTIFY)     { if (showNotify(now)) mode = EYES; delay(30); return; }
-  if (mode == NOTIFYFULL) { if (showNotifyFull(now)) { notifyApp = ""; notifyFull = ""; mode = EYES; } delay(30); return; }
+  if (mode != FIND) setInverted(false);
+  if (mode == MUSIC) {
+    if (musicState == "PAUSED" && now - musicPausedAt > MUSIC_PAUSE_TIMEOUT_MS) mode = EYES;
+    else { drawMusic(now); delay(35); return; }
+  }
+  if (mode == CLOCK)  { showClock(); if (now - modeStart > 5000) mode = homeMode(); delay(30); return; }
+  if (mode == WATER)  { showWater(now); if (now - modeStart > 20000) { mode = homeMode(); lastWater = now; } delay(30); return; }
+  if (mode == NOTIFY)     { if (showNotify(now)) mode = homeMode(); delay(30); return; }
+  if (mode == NOTIFYFULL) { if (showNotifyFull(now)) { notifyApp = ""; notifyFull = ""; mode = homeMode(); } delay(30); return; }
+  if (mode == FIND)       { if (showFind(now)) { setInverted(false); mode = homeMode(); } delay(30); return; }
 
   if (isBirthday()) { showBirthday(now); delay(30); return; }
-  if (now - lastWater >= waterIntervalMs) { mode = WATER; modeStart = now; }
+  if (now - lastWater >= waterIntervalMs) {
+    // no nagging while Nano is sleepy or asleep; restart the timer instead
+    if (activeHours() && !isSleepHours()) { mode = WATER; modeStart = now; }
+    else lastWater = now;
+  }
   updateEyes(now);
   delay(30);
 }
