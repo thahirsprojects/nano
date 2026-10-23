@@ -11,7 +11,7 @@
 //
 //  PHONE -> NANO COMMANDS (write text to the one BLE characteristic):
 //    T|<utc epoch seconds>|<tz offset seconds>    set the clock
-//    N|AppName|full message                       show a notification
+//    N|AppName|sender                             show a notification (who sent it)
 //    S|name|HH:MM start|HH:MM end|water minutes  change settings
 //    M|title|artist|PLAYING/PAUSED/STOPPED        music metadata
 //    W                                            test the water screen
@@ -73,10 +73,10 @@ const unsigned long HOLD_MS       = 600;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 Preferences prefs;
 
-enum Mode { EYES, CLOCK, WATER, NOTIFY, NOTIFYFULL, MUSIC, FIND };
+enum Mode { EYES, CLOCK, WATER, NOTIFY, MUSIC, FIND };
 Mode mode = EYES;
 unsigned long modeStart = 0;
-String notifyApp = "", notifyFull = "";
+String notifyApp = "", notifyFrom = "";       // app + who sent it (no message text)
 
 // Compact music metadata. The OLED shows at most 3 title words and 2 artist words.
 String musicTitle = "", musicArtist = "", musicState = "STOPPED";
@@ -746,7 +746,7 @@ void drawAppLogo(String n, int cx, int cy) {
   }
 }
 
-// clean notification: app logo + app name, a quick pop-in, no scrolling
+// notification: app logo + who sent it, a quick pop-in, no message text
 bool showNotify(unsigned long now) {
   unsigned long el = now - modeStart;
   display.clearDisplay();
@@ -758,52 +758,23 @@ bool showNotify(unsigned long now) {
   }
   drawAppLogo(notifyApp, cx, cy);
 
-  String fn = appFriendly(notifyApp);
-  if (fn.length() > 20) fn = fn.substring(0, 20);
+  // who sent it (falls back to the app name, e.g. in private mode)
+  String who = notifyFrom.length() ? notifyFrom : appFriendly(notifyApp);
   display.setTextColor(SSD1306_WHITE);
-  int tw = fn.length() * 12; int ty = 46;
-  display.setTextSize(2);
-  if (tw > 124) { display.setTextSize(1); tw = fn.length() * 6; ty = 50; }
-  display.setCursor((128 - tw) / 2, ty);
-  display.print(fn);
-
-  display.display();
-  return el > 5000;                          // show for 5s
-}
-
-// full message as small wrapped text (no scrolling)
-void drawWrapped(String s, int x, int y, int maxLines) {
-  display.setTextSize(1);
-  int maxc = 21, line = 0;                    // ~21 chars per line at size 1
-  s.trim();
-  while (s.length() && line < maxLines) {
-    String seg = s;
-    if (seg.length() > maxc) {
-      int cut = seg.lastIndexOf(' ', maxc);
-      if (cut <= 0) cut = maxc;
-      seg = s.substring(0, cut);
-      s = s.substring(seg.length());
-    } else {
-      s = "";
-    }
-    s.trim();
-    display.setCursor(x, y + line * 10);
-    display.print(seg);
-    line++;
+  int ty = 46;
+  if (who.length() <= 10) {                  // big text fits up to 10 letters
+    display.setTextSize(2);
+  } else {
+    display.setTextSize(1);
+    ty = 50;
+    if (who.length() > 21) who = who.substring(0, 19) + "..";
   }
-}
+  int tw = who.length() * (ty == 46 ? 12 : 6);
+  display.setCursor((128 - tw) / 2, ty);
+  display.print(who);
 
-// tap-to-read: app name header + full message, small text, no scroll
-bool showNotifyFull(unsigned long now) {
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.print(appFriendly(notifyApp));
-  display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
-  drawWrapped(notifyFull, 0, 14, 5);         // up to 5 lines
   display.display();
-  return (now - modeStart) > 12000;          // auto-close after 12s
+  return el > 5000;                          // show for 5s, then back on its own
 }
 
 // "find my Nano": big surprised eyes, flashing screen
@@ -886,10 +857,10 @@ void handleCommand(String c) {
   } else if (type == 'N' || type == 'R') {        // N|App|message   R|App|caller = incoming call
     rest = asciiOnly(rest);
     int bar = rest.indexOf('|');
-    if (bar >= 0) { notifyApp = rest.substring(0, bar); notifyFull = rest.substring(bar + 1); }
-    else          { notifyApp = rest; notifyFull = rest; }
-    notifyApp.trim(); notifyFull.trim();
-    notifyFull = notifyFull.substring(0, 110);
+    if (bar >= 0) { notifyApp = rest.substring(0, bar); notifyFrom = rest.substring(bar + 1); }
+    else          { notifyApp = rest; notifyFrom = ""; }
+    notifyApp.trim(); notifyFrom.trim();
+    notifyFrom = notifyFrom.substring(0, 40);
     mode = NOTIFY; modeStart = millis(); pendingTap = false;
     if (type == 'R') playSound(SND_CALL, 20000, false);     // ring until tapped or 20 s
     else if (!isPlaying(SND_CALL)) playSound(SND_NOTIFY, 0, false);
@@ -1035,9 +1006,7 @@ void loop() {
         pendingTap = true;
         lastTapTime = now;
       }
-    } else if (mode == NOTIFY) { mode = NOTIFYFULL; modeStart = now; pendingTap = false; }
-    else if (mode == NOTIFYFULL) { notifyApp = ""; notifyFull = ""; mode = homeMode(); pendingTap = false; }
-    else if (mode == WATER) {                     // tapped away = "I drank" -> phone counts it
+    } else if (mode == WATER) {                     // tapped away = "I drank" -> phone counts it
       lastWater = now; mode = homeMode(); pendingTap = false;
       sendToPhone("H|WATER");
     }
@@ -1064,7 +1033,6 @@ void loop() {
   if (mode == CLOCK)  { showClock(); if (now - modeStart > 5000) mode = homeMode(); delay(30); return; }
   if (mode == WATER)  { showWater(now); if (now - modeStart > 20000) { mode = homeMode(); lastWater = now; } delay(30); return; }
   if (mode == NOTIFY)     { if (showNotify(now)) mode = homeMode(); delay(30); return; }
-  if (mode == NOTIFYFULL) { if (showNotifyFull(now)) { notifyApp = ""; notifyFull = ""; mode = homeMode(); } delay(30); return; }
   if (mode == FIND)       { if (showFind(now)) { setInverted(false); if (isPlaying(SND_FIND)) stopSound(); mode = homeMode(); } delay(30); return; }
 
   if (isBirthday()) {
