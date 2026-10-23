@@ -1,5 +1,7 @@
 // ===================================================================
 //  NANO (BLE version) - a cute OLED desk companion you can carry
+//  Developed by Mohamed Thahir - https://github.com/thahirsprojects
+//  Android app: https://github.com/thahirsprojects/nano-companion-android
 //  - No Wi-Fi needed. The phone talks to Nano over Bluetooth LE.
 //  - Daytime cute eyes, evening tired eyes, night sleep ("Zzz")
 //  - ONE TAP    : clock ("Assalamu Alaikum" style clock + date)
@@ -21,6 +23,9 @@
 //    Q                                            stop ringing (call answered/ended)
 //    B|on|volume 0-2|flags                         sound settings (see SF_* flags)
 //    P|<sound id>                                 preview a sound
+//    Z|<minutes>                                  mute sounds for a while (0 = unmute)
+//    D|0/1                                        phone Do Not Disturb (quiet while on)
+//    L|<percent>|<charging 0/1>                   phone battery on the clock screen (-1 hides)
 //  NANO -> PHONE (BLE notify on the same characteristic):
 //    C|NEXT, C|PREV, C|PLAYPAUSE                  music controls
 //    H|WATER                                      water reminder tapped away
@@ -76,7 +81,15 @@ Preferences prefs;
 enum Mode { EYES, CLOCK, WATER, NOTIFY, MUSIC, FIND };
 Mode mode = EYES;
 unsigned long modeStart = 0;
+
+// Time on the current screen. modeStart is often set (millis()) after loop() read
+// "now", so plain now - modeStart could wrap to a huge number and close the
+// screen instantly (the sound played but nothing showed). Clamp to 0 instead.
+unsigned long modeElapsed(unsigned long now) {
+  return ((long)(now - modeStart) > 0) ? (now - modeStart) : 0;
+}
 String notifyApp = "", notifyFrom = "";       // app + who sent it (no message text)
+bool notifyIsCall = false;             // the notification screen is an incoming call
 
 // Compact music metadata. The OLED shows at most 3 title words and 2 artist words.
 String musicTitle = "", musicArtist = "", musicState = "STOPPED";
@@ -149,6 +162,11 @@ const int SF_NOTIFY = 1, SF_CALL = 2, SF_WATER = 4, SF_FIND = 8, SF_TOUCH = 16,
 const int SF_DEFAULT = SF_NOTIFY | SF_CALL | SF_WATER | SF_FIND | SF_TOUCH | SF_BOOT | SF_BIRTHDAY;
 
 bool soundOn = true;
+bool phoneDnd = false;                // phone is in Do Not Disturb (D command)
+bool muteTimed = false;               // "mute for N minutes" from the app (Z command)
+unsigned long muteUntil = 0;
+int  phoneBattery = -1;               // phone battery % for the clock screen (-1 = hidden)
+bool phoneCharging = false;
 int  soundVolume = 1;                 // 0 low, 1 medium, 2 high
 int  soundFlags = SF_DEFAULT;
 
@@ -225,6 +243,11 @@ bool soundAllowed(int id) {
   if (!(soundFlags & SOUND_FLAG[id])) return false;
   if (id == SND_FIND) return true;                // finding Nano always beeps
   if (!soundOn) return false;
+  if (phoneDnd) return false;
+  if (muteTimed) {
+    if ((long)(millis() - muteUntil) < 0) return false;
+    muteTimed = false;                            // mute time is over
+  }
   if (isSleepHours()) return false;
   if ((soundFlags & SF_QUIET_OFF_HOURS) && !activeHours()) return false;
   return true;
@@ -641,11 +664,15 @@ void showClock() {
   display.setTextSize(1);
   if (ok) { display.setCursor((128 - (int)strlen(date) * 6) / 2, 46); display.print(date); }
   else { display.setCursor(4, 46); display.print("waiting for phone..."); }
+  if (phoneBattery >= 0) {                   // phone battery, top right
+    String b = String("Phone ") + phoneBattery + "%" + (phoneCharging ? "+" : "");
+    display.setCursor(128 - (int)b.length() * 6, 2); display.print(b);
+  }
   display.display();
 }
 
 void showWater(unsigned long now) {
-  float t = (now - modeStart) / 1000.0;
+  float t = modeElapsed(now) / 1000.0;
   display.clearDisplay();
 
   // --- a glass on the left with wavy water + rising bubbles ---
@@ -675,7 +702,7 @@ void showWater(unsigned long now) {
   display.setCursor(56, 30); display.print("WATER");
 
   // --- countdown bar (how long the reminder stays) ---
-  int total = 20000, rem = total - (int)(now - modeStart);
+  int total = 20000, rem = total - (int)modeElapsed(now);
   if (rem < 0) rem = 0;
   int barX = 56, barW = 66;
   display.drawRect(barX, 52, barW, 6, SSD1306_WHITE);
@@ -694,6 +721,7 @@ String appFriendly(String n) {
   if (l.indexOf("telegram") >= 0) return "Telegram";
   if (l.indexOf("facebook") >= 0) return "Facebook";
   if (l.indexOf("youtube") >= 0) return "YouTube";
+  if (l.indexOf("battery") >= 0) return "Battery";
   if (l.indexOf("phone") >= 0 || l.indexOf("dialer") >= 0 || l.indexOf("call") >= 0) return "Phone";
   return n;
 }
@@ -737,6 +765,10 @@ void drawAppLogo(String n, int cx, int cy) {
     for (int i = 0; i <= 8; i++) display.fillCircle(cx - 8 + i * 16 / 8, cy - 8 + i * 16 / 8, 3, SSD1306_WHITE);
     display.fillCircle(cx - 9, cy - 9, 4, SSD1306_WHITE);
     display.fillCircle(cx + 9, cy + 9, 4, SSD1306_WHITE);
+  } else if (l.indexOf("battery") >= 0) {     // phone battery low
+    display.drawRect(cx - 15, cy - 9, 28, 18, SSD1306_WHITE);
+    display.fillRect(cx + 13, cy - 4, 3, 8, SSD1306_WHITE);
+    display.fillRect(cx - 12, cy - 6, 5, 12, SSD1306_WHITE);
   } else {                                   // unknown app: a rounded tile with its initial
     display.fillRoundRect(cx - 16, cy - 16, 32, 32, 8, SSD1306_WHITE);
     display.setTextColor(SSD1306_BLACK); display.setTextSize(3);
@@ -748,7 +780,7 @@ void drawAppLogo(String n, int cx, int cy) {
 
 // notification: app logo + who sent it, a quick pop-in, no message text
 bool showNotify(unsigned long now) {
-  unsigned long el = now - modeStart;
+  unsigned long el = modeElapsed(now);
   display.clearDisplay();
   int cx = 64, cy = 22;
 
@@ -774,12 +806,12 @@ bool showNotify(unsigned long now) {
   display.print(who);
 
   display.display();
-  return el > 5000;                          // show for 5s, then back on its own
+  return el > (notifyIsCall ? 20000UL : 5000UL);   // 5 s (calls: while ringing), then back
 }
 
 // "find my Nano": big surprised eyes, flashing screen
 bool showFind(unsigned long now) {
-  unsigned long el = now - modeStart;
+  unsigned long el = modeElapsed(now);
   display.clearDisplay();
   drawEye(36, 26, 1.0, SURPRISED, true);
   drawEye(92, 26, 1.0, SURPRISED, false);
@@ -854,19 +886,37 @@ void handleCommand(String c) {
     long tz  = (bar < 0) ? 19800 : rest.substring(bar + 1).toInt();
     if (utc > 1577836800L) setClock(utc, tz);
 
-  } else if (type == 'N' || type == 'R') {        // N|App|message   R|App|caller = incoming call
+  } else if (type == 'N' || type == 'R') {        // N|App|sender (5 s)   R|App|caller = incoming call
     rest = asciiOnly(rest);
     int bar = rest.indexOf('|');
     if (bar >= 0) { notifyApp = rest.substring(0, bar); notifyFrom = rest.substring(bar + 1); }
     else          { notifyApp = rest; notifyFrom = ""; }
     notifyApp.trim(); notifyFrom.trim();
     notifyFrom = notifyFrom.substring(0, 40);
+    notifyIsCall = (type == 'R');
     mode = NOTIFY; modeStart = millis(); pendingTap = false;
     if (type == 'R') playSound(SND_CALL, 20000, false);     // ring until tapped or 20 s
     else if (!isPlaying(SND_CALL)) playSound(SND_NOTIFY, 0, false);
 
   } else if (type == 'Q') {                       // call answered/ended: stop ringing
     if (isPlaying(SND_CALL)) stopSound();
+    if (mode == NOTIFY && notifyIsCall) mode = homeMode();   // call screen goes too
+
+  } else if (type == 'Z') {                       // Z|minutes: mute for a while (0 = unmute)
+    long minutes = rest.toInt();
+    muteTimed = minutes > 0;
+    muteUntil = millis() + (unsigned long)minutes * 60000UL;
+    if (muteTimed && !isPlaying(SND_FIND)) stopSound();
+
+  } else if (type == 'D') {                       // D|1 phone Do Not Disturb on, D|0 off
+    phoneDnd = rest.toInt() != 0;
+    if (phoneDnd && !isPlaying(SND_FIND)) stopSound();
+
+  } else if (type == 'L') {                       // L|percent|charging  phone battery (-1 hides it)
+    int bar = rest.indexOf('|');
+    phoneBattery = (bar < 0 ? rest : rest.substring(0, bar)).toInt();
+    if (phoneBattery > 100) phoneBattery = 100;
+    phoneCharging = bar >= 0 && rest.substring(bar + 1).toInt() != 0;
 
   } else if (type == 'B') {                       // B|on|volume 0-2|flags
     String parts[3]; int n = 0; String r = rest;
@@ -956,6 +1006,7 @@ void loop() {
     qTail = (qTail + 1) % CMD_Q_SIZE;
     handleCommand(c);
   }
+  now = millis();                                // commands may have taken a moment
   updateSound(now);
 
   // phone went away: its music info is stale now
@@ -1030,8 +1081,8 @@ void loop() {
     if (musicState == "PAUSED" && now - musicPausedAt > MUSIC_PAUSE_TIMEOUT_MS) mode = EYES;
     else { drawMusic(now); delay(35); return; }
   }
-  if (mode == CLOCK)  { showClock(); if (now - modeStart > 5000) mode = homeMode(); delay(30); return; }
-  if (mode == WATER)  { showWater(now); if (now - modeStart > 20000) { mode = homeMode(); lastWater = now; } delay(30); return; }
+  if (mode == CLOCK)  { showClock(); if (modeElapsed(now) > 5000) mode = homeMode(); delay(30); return; }
+  if (mode == WATER)  { showWater(now); if (modeElapsed(now) > 20000) { mode = homeMode(); lastWater = now; } delay(30); return; }
   if (mode == NOTIFY)     { if (showNotify(now)) mode = homeMode(); delay(30); return; }
   if (mode == FIND)       { if (showFind(now)) { setInverted(false); if (isPlaying(SND_FIND)) stopSound(); mode = homeMode(); } delay(30); return; }
 
