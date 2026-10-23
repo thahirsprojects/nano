@@ -778,18 +778,17 @@ void handleCommand(String c) {
       fields[n++] = r.substring(0, b);
       r = r.substring(b + 1);
     }
-    String oldTitle = musicTitle, oldState = musicState;
+    String oldState = musicState;
     if (n >= 1) musicTitle = compactWords(fields[0], 3, 20);
     if (n >= 2) musicArtist = compactWords(fields[1], 2, 18);
     if (n >= 3) { fields[2].trim(); fields[2].toUpperCase(); musicState = fields[2]; }
     if (musicState != "PLAYING" && musicState != "PAUSED") musicState = "STOPPED";
-    bool changed = (musicTitle != oldTitle) || (musicState != oldState);
 
     if (musicState == "STOPPED") {
       if (mode == MUSIC) mode = EYES;
     } else if (musicState == "PAUSED") {
       if (oldState != "PAUSED") musicPausedAt = millis();   // music screen times out later
-    } else if (changed && canShowMusic() && mode != MUSIC) {
+    } else if (canShowMusic() && mode != MUSIC) {   // PLAYING: show it whenever Nano is idle
       mode = MUSIC;
       modeStart = millis();
       pendingTap = false;
