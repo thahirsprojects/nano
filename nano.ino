@@ -17,14 +17,20 @@
 //    W                                            test the water screen
 //    E|<0-3>                                      eye style (normal/happy/surprised/angry)
 //    F                                            find me: flash the screen
+//    R|App|caller                                 incoming call (rings until tapped)
+//    Q                                            stop ringing (call answered/ended)
+//    B|on|volume 0-2|flags                         sound settings (see SF_* flags)
+//    P|<sound id>                                 preview a sound
 //  NANO -> PHONE (BLE notify on the same characteristic):
 //    C|NEXT, C|PREV, C|PLAYPAUSE                  music controls
 //    H|WATER                                      water reminder tapped away
 //    E|<0-3>                                      eye style changed by double tap
 //
-//  WIRING (unchanged):
+//  WIRING:
 //    OLED VCC->3V3 GND->GND SCK->P22 SDA->P21
 //    TTP223 VCC->3V3/5V GND->GND SIG->P4
+//    Passive buzzer (+)->P25 (-)->GND  (add a 220 ohm resistor or an NPN
+//    transistor later, then set BUZZER_DIRECT to 0 for full volume)
 // ===================================================================
 
 #include <Preferences.h>
@@ -37,6 +43,8 @@
 #include <BLE2902.h>
 #include <sys/time.h>
 #include <time.h>
+#include <esp_arduino_version.h>
+#include "driver/gpio.h"
 
 // ====== BLE IDs (the Android app must use the same two) ======
 #define SERVICE_UUID "7a1c0001-5e0d-4b8e-9f3a-2d6c1b4a0001"
@@ -124,6 +132,128 @@ const char* CUTE[] = {
 const int CUTE_N = sizeof(CUTE) / sizeof(CUTE[0]);
 
 // ===============================================================
+//  BUZZER (passive buzzer: + -> P25, - -> GND)
+// ===============================================================
+#define BUZZER_PIN    25
+// 1 = buzzer wired straight to the pin (no resistor/transistor yet): the pin runs
+//     at its weakest drive strength and the sound is kept quiet to protect the ESP32.
+// 0 = buzzer driven through a 220 ohm resistor or an NPN transistor: full volume.
+#define BUZZER_DIRECT 1
+
+enum Sound { SND_NOTIFY, SND_CALL, SND_WATER, SND_FIND, SND_HAPPY, SND_CLICK,
+             SND_BOOT, SND_BIRTHDAY, SND_COUNT };
+
+// sound setting flags (B command), one bit per kind of sound
+const int SF_NOTIFY = 1, SF_CALL = 2, SF_WATER = 4, SF_FIND = 8, SF_TOUCH = 16,
+          SF_BOOT = 32, SF_BIRTHDAY = 64, SF_QUIET_OFF_HOURS = 128;
+const int SF_DEFAULT = SF_NOTIFY | SF_CALL | SF_WATER | SF_FIND | SF_TOUCH | SF_BOOT | SF_BIRTHDAY;
+
+bool soundOn = true;
+int  soundVolume = 1;                 // 0 low, 1 medium, 2 high
+int  soundFlags = SF_DEFAULT;
+
+struct Note { uint16_t freq; uint16_t ms; };   // freq 0 = rest, ms 0 = end of tune
+const Note TUNE_NOTIFY[]   = { {1568, 70}, {0, 40}, {2093, 110}, {0, 0} };
+const Note TUNE_CALL[]     = { {1760, 120}, {1397, 120}, {1760, 120}, {1397, 120}, {0, 900}, {0, 0} };
+const Note TUNE_WATER[]    = { {1047, 110}, {1319, 110}, {1568, 110}, {2093, 220}, {0, 0} };
+const Note TUNE_FIND[]     = { {2637, 90}, {0, 60}, {2637, 90}, {0, 60}, {2637, 90}, {0, 450}, {0, 0} };
+const Note TUNE_HAPPY[]    = { {1319, 60}, {1568, 60}, {2093, 90}, {0, 0} };
+const Note TUNE_CLICK[]    = { {2400, 25}, {0, 0} };
+const Note TUNE_BOOT[]     = { {784, 90}, {1047, 90}, {1319, 90}, {1568, 160}, {0, 0} };
+const Note TUNE_BIRTHDAY[] = { {1047, 180}, {1047, 90}, {1175, 270}, {1047, 270}, {1397, 270}, {1319, 540},
+                               {0, 120},
+                               {1047, 180}, {1047, 90}, {1175, 270}, {1047, 270}, {1568, 270}, {1397, 540},
+                               {0, 0} };
+
+const Note* const TUNES[SND_COUNT] = { TUNE_NOTIFY, TUNE_CALL, TUNE_WATER, TUNE_FIND,
+                                       TUNE_HAPPY, TUNE_CLICK, TUNE_BOOT, TUNE_BIRTHDAY };
+const int SOUND_FLAG[SND_COUNT]    = { SF_NOTIFY, SF_CALL, SF_WATER, SF_FIND,
+                                       SF_TOUCH, SF_TOUCH, SF_BOOT, SF_BIRTHDAY };
+
+// PWM duty (10-bit) per volume; a passive buzzer is loudest at 50 % (512)
+#if BUZZER_DIRECT
+const uint32_t VOLUME_DUTY[3] = { 24, 64, 160 };
+#else
+const uint32_t VOLUME_DUTY[3] = { 48, 160, 512 };
+#endif
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  #define BUZZ_TARGET BUZZER_PIN       // core 3.x: LEDC calls take the pin
+#else
+  #define BUZZ_CHANNEL 4
+  #define BUZZ_TARGET BUZZ_CHANNEL     // core 2.x: LEDC calls take a channel
+#endif
+
+const Note* tune = nullptr;
+int tuneIdx = 0;
+unsigned long noteEnd = 0;
+unsigned long tuneStopAt = 0;         // repeat the tune until then (0 = play once)
+
+void buzzerBegin() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(BUZZER_PIN, 2000, 10);
+#else
+  ledcSetup(BUZZ_CHANNEL, 2000, 10);
+  ledcAttachPin(BUZZER_PIN, BUZZ_CHANNEL);
+#endif
+  ledcWrite(BUZZ_TARGET, 0);
+#if BUZZER_DIRECT
+  gpio_set_drive_capability((gpio_num_t)BUZZER_PIN, GPIO_DRIVE_CAP_0);
+#endif
+}
+
+void buzzerTone(uint16_t freq) {
+  if (freq == 0) { ledcWrite(BUZZ_TARGET, 0); return; }
+  ledcWriteTone(BUZZ_TARGET, freq);   // sets the frequency (10-bit, 50 % duty)
+  ledcWrite(BUZZ_TARGET, VOLUME_DUTY[soundVolume]);
+}
+
+void stopSound() {
+  tune = nullptr;
+  tuneStopAt = 0;
+  buzzerTone(0);
+}
+
+bool isPlaying(int id) { return tune == TUNES[id]; }
+
+void startNote(unsigned long now) {
+  buzzerTone(tune[tuneIdx].freq);
+  noteEnd = now + tune[tuneIdx].ms;
+}
+
+bool soundAllowed(int id) {
+  if (!(soundFlags & SOUND_FLAG[id])) return false;
+  if (id == SND_FIND) return true;                // finding Nano always beeps
+  if (!soundOn) return false;
+  if (isSleepHours()) return false;
+  if ((soundFlags & SF_QUIET_OFF_HOURS) && !activeHours()) return false;
+  return true;
+}
+
+// repeatMs > 0 loops the tune for that long; preview (from the app) ignores the settings
+void playSound(int id, unsigned long repeatMs, bool preview) {
+  if (id < 0 || id >= SND_COUNT) return;
+  if (!preview && !soundAllowed(id)) return;
+  if (id == SND_CLICK && tune != nullptr) return;  // a click never cuts another sound
+  unsigned long now = millis();
+  tune = TUNES[id];
+  tuneIdx = 0;
+  tuneStopAt = repeatMs ? now + repeatMs : 0;
+  startNote(now);
+}
+
+// called every loop(); plays the next note without blocking the animations
+void updateSound(unsigned long now) {
+  if (tune == nullptr || (long)(now - noteEnd) < 0) return;
+  tuneIdx++;
+  if (tune[tuneIdx].ms == 0) {                    // end of the tune
+    if (tuneStopAt != 0 && (long)(now - tuneStopAt) < 0) tuneIdx = 0;
+    else { stopSound(); return; }
+  }
+  startNote(now);
+}
+
+// ===============================================================
 void applyWater() { waterIntervalMs = (unsigned long)waterMin * 60000UL; }
 
 void loadSettings() {
@@ -136,6 +266,10 @@ void loadSettings() {
   if (actStart < 0 || actStart >= 24 * 60) actStart = 9 * 60;
   if (actEnd < 0 || actEnd >= 24 * 60) actEnd = 17 * 60 + 30;
   if (waterMin < 1 || waterMin > 240) waterMin = 20;
+  soundOn     = prefs.getBool("so", true);
+  soundVolume = prefs.getInt("sv", 1);
+  soundFlags  = prefs.getInt("sf", SF_DEFAULT);
+  if (soundVolume < 0 || soundVolume > 2) soundVolume = 1;
   applyWater();
 }
 
@@ -145,6 +279,9 @@ void saveSettings() {
   if (prefs.getInt("as", -1) != actStart) prefs.putInt("as", actStart);
   if (prefs.getInt("ae", -1) != actEnd) prefs.putInt("ae", actEnd);
   if (prefs.getInt("wm", -1) != waterMin) prefs.putInt("wm", waterMin);
+  if (prefs.getBool("so", !soundOn) != soundOn) prefs.putBool("so", soundOn);
+  if (prefs.getInt("sv", -1) != soundVolume) prefs.putInt("sv", soundVolume);
+  if (prefs.getInt("sf", -1) != soundFlags) prefs.putInt("sf", soundFlags);
 }
 
 void drawHeart(int cx, int cy, int s) {
@@ -319,6 +456,7 @@ void setup() {
     while (true) delay(1000);
   }
   display.setTextColor(SSD1306_WHITE);
+  buzzerBegin();
   bootScreen();
 
   startBLE();
@@ -332,6 +470,7 @@ void setup() {
   lastWater = now;
   nextBlink = now + random(2000, 5000);
   nextLook  = now + random(1500, 3500);
+  playSound(SND_BOOT, 0, false);                // played by loop(), so it never blocks
 }
 
 // ===============================================================
@@ -744,7 +883,7 @@ void handleCommand(String c) {
     long tz  = (bar < 0) ? 19800 : rest.substring(bar + 1).toInt();
     if (utc > 1577836800L) setClock(utc, tz);
 
-  } else if (type == 'N') {                       // N|App|message
+  } else if (type == 'N' || type == 'R') {        // N|App|message   R|App|caller = incoming call
     rest = asciiOnly(rest);
     int bar = rest.indexOf('|');
     if (bar >= 0) { notifyApp = rest.substring(0, bar); notifyFull = rest.substring(bar + 1); }
@@ -752,6 +891,28 @@ void handleCommand(String c) {
     notifyApp.trim(); notifyFull.trim();
     notifyFull = notifyFull.substring(0, 110);
     mode = NOTIFY; modeStart = millis(); pendingTap = false;
+    if (type == 'R') playSound(SND_CALL, 20000, false);     // ring until tapped or 20 s
+    else if (!isPlaying(SND_CALL)) playSound(SND_NOTIFY, 0, false);
+
+  } else if (type == 'Q') {                       // call answered/ended: stop ringing
+    if (isPlaying(SND_CALL)) stopSound();
+
+  } else if (type == 'B') {                       // B|on|volume 0-2|flags
+    String parts[3]; int n = 0; String r = rest;
+    while (n < 3) {
+      int b = r.indexOf('|');
+      if (b < 0) { parts[n++] = r; break; }
+      parts[n++] = r.substring(0, b);
+      r = r.substring(b + 1);
+    }
+    if (n >= 1 && parts[0].length()) soundOn = parts[0].toInt() != 0;
+    if (n >= 2) { int v = parts[1].toInt(); if (v >= 0 && v <= 2) soundVolume = v; }
+    if (n >= 3 && parts[2].length()) soundFlags = parts[2].toInt() & 0xFF;
+    if (!soundOn && !isPlaying(SND_FIND)) stopSound();
+    saveSettings();
+
+  } else if (type == 'P') {                       // P|<sound id> preview from the app
+    if (rest.length()) playSound(rest.toInt(), 0, true);
 
   } else if (type == 'S') {                       // S|name|HH:MM|HH:MM|minutes
     String parts[4]; int n = 0; String r = asciiOnly(rest);
@@ -797,12 +958,14 @@ void handleCommand(String c) {
 
   } else if (type == 'W') {                       // test water screen
     mode = WATER; modeStart = millis(); pendingTap = false;
+    playSound(SND_WATER, 0, false);
 
   } else if (type == 'E') {                       // E|0..3 eye style
     if (rest.length()) setEyeStyle(rest.toInt());
 
   } else if (type == 'F') {                       // find my Nano
     mode = FIND; modeStart = millis(); pendingTap = false;
+    playSound(SND_FIND, FIND_MS, false);
   }
 }
 
@@ -822,6 +985,7 @@ void loop() {
     qTail = (qTail + 1) % CMD_Q_SIZE;
     handleCommand(c);
   }
+  updateSound(now);
 
   // phone went away: its music info is stale now
   bool connectedNow = phoneConnected;
@@ -847,6 +1011,7 @@ void loop() {
   // ---- HOLD = pet (only from the eyes screen) ----
   if (mode == EYES && touch && !petActive && (now - pressStart >= HOLD_MS)) {
     petActive = true; pendingTap = false;
+    playSound(SND_HAPPY, 0, false);
     petWord = CUTE[random(CUTE_N)]; petWordNext = now + 1500;
   }
   if (petActive) {
@@ -859,6 +1024,9 @@ void loop() {
 
   // ---- taps register on release of a SHORT press ----
   if (falling && (now - pressStart < HOLD_MS) && !musicLongTriggered) {
+    // a tap silences a ringing call or the find beeps; otherwise it clicks
+    if (isPlaying(SND_CALL) || isPlaying(SND_FIND)) stopSound();
+    else playSound(SND_CLICK, 0, false);
     if (mode == MUSIC) {
       if (pendingTap && (now - lastTapTime <= DOUBLE_TAP_MS)) {
         pendingTap = false;
@@ -897,12 +1065,20 @@ void loop() {
   if (mode == WATER)  { showWater(now); if (now - modeStart > 20000) { mode = homeMode(); lastWater = now; } delay(30); return; }
   if (mode == NOTIFY)     { if (showNotify(now)) mode = homeMode(); delay(30); return; }
   if (mode == NOTIFYFULL) { if (showNotifyFull(now)) { notifyApp = ""; notifyFull = ""; mode = homeMode(); } delay(30); return; }
-  if (mode == FIND)       { if (showFind(now)) { setInverted(false); mode = homeMode(); } delay(30); return; }
+  if (mode == FIND)       { if (showFind(now)) { setInverted(false); if (isPlaying(SND_FIND)) stopSound(); mode = homeMode(); } delay(30); return; }
 
-  if (isBirthday()) { showBirthday(now); delay(30); return; }
+  if (isBirthday()) {
+    static int tunePlayedDay = -1;                // sing once per birthday
+    struct tm ti;
+    if (getNow(ti) && ti.tm_yday != tunePlayedDay && soundAllowed(SND_BIRTHDAY) && tune == nullptr) {
+      tunePlayedDay = ti.tm_yday;                 // waits until sound is allowed (not at midnight)
+      playSound(SND_BIRTHDAY, 0, false);
+    }
+    showBirthday(now); delay(30); return;
+  }
   if (now - lastWater >= waterIntervalMs) {
     // no nagging while Nano is sleepy or asleep; restart the timer instead
-    if (activeHours() && !isSleepHours()) { mode = WATER; modeStart = now; }
+    if (activeHours() && !isSleepHours()) { mode = WATER; modeStart = now; playSound(SND_WATER, 0, false); }
     else lastWater = now;
   }
   updateEyes(now);
