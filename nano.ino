@@ -17,19 +17,19 @@
 //    S|name|HH:MM start|HH:MM end|water minutes  change settings
 //    M|title|artist|PLAYING/PAUSED/STOPPED        music metadata
 //    W                                            test the water screen
-//    E|<0-3>                                      eye style (normal/happy/surprised/angry)
+//    E|<0-4>                                      eye style (normal/happy/surprised/angry/buddy)
 //    F                                            find me: flash the screen
-//    R|App|caller                                 incoming call (rings until tapped)
-//    Q                                            stop ringing (call answered/ended)
-//    B|on|volume 0-2|flags                         sound settings (see SF_* flags)
-//    P|<sound id>                                 preview a sound
+//    R|App|caller                                 incoming call: rings until Q or a tap
+//    Q                                            call answered, declined or missed: stop ringing
+//    B|on|volume 0-2|flags|ringtone 0-7           sound settings (see SF_* flags, RINGTONES)
+//    P|<sound id>, P|r<ringtone>, P|s             preview a sound or a ringtone, stop it
 //    Z|<minutes>                                  mute sounds for a while (0 = unmute)
 //    D|0/1                                        phone Do Not Disturb (quiet while on)
 //    L|<percent>|<charging 0/1>                   phone battery on the clock screen (-1 hides)
 //  NANO -> PHONE (BLE notify on the same characteristic):
 //    C|NEXT, C|PREV, C|PLAYPAUSE                  music controls
 //    H|WATER                                      water reminder tapped away
-//    E|<0-3>                                      eye style changed by double tap
+//    E|<0-4>                                      eye style changed by double tap
 //
 //  WIRING:
 //    OLED VCC->3V3 GND->GND SCK->P22 SDA->P21
@@ -50,6 +50,9 @@
 #include <time.h>
 #include <esp_arduino_version.h>
 #include "driver/gpio.h"
+
+// a buzzer note; declared up here so the IDE's auto-generated prototypes can use it
+struct Note { uint16_t freq; uint16_t ms; };   // freq 0 = rest, ms 0 = end of tune
 
 // ====== BLE IDs (the Android app must use the same two) ======
 #define SERVICE_UUID "7a1c0001-5e0d-4b8e-9f3a-2d6c1b4a0001"
@@ -90,6 +93,9 @@ unsigned long modeElapsed(unsigned long now) {
 }
 String notifyApp = "", notifyFrom = "";       // app + who sent it (no message text)
 bool notifyIsCall = false;             // the notification screen is an incoming call
+bool callActive = false;               // a call is ringing (until Q, a tap or disconnect)
+unsigned long callStart = 0;
+const unsigned long CALL_MAX_MS = 180000;   // safety stop if "call ended" never arrives
 
 // Compact music metadata. The OLED shows at most 3 title words and 2 artist words.
 String musicTitle = "", musicArtist = "", musicState = "STOPPED";
@@ -97,11 +103,12 @@ unsigned long musicPausedAt = 0;
 const unsigned long MUSIC_PAUSE_TIMEOUT_MS = 30000;   // paused music screen -> eyes
 const unsigned long FIND_MS = 8000;
 
-enum Mood { NORMAL, HAPPY, ANGRY, SURPRISED, TIRED, SLEEP };
+enum Mood { NORMAL, HAPPY, ANGRY, SURPRISED, TIRED, SLEEP, BUDDY };
 int mood = NORMAL;
-int activeMood = NORMAL;            // cute-hours expression; double tap changes it
-const int MOOD_ORDER[] = { NORMAL, HAPPY, SURPRISED, ANGRY };   // index = eye style sent by the phone
-int moodPick = 0;
+int activeMood = BUDDY;             // cute-hours expression; double tap changes it
+const int MOOD_ORDER[] = { NORMAL, HAPPY, SURPRISED, ANGRY, BUDDY };   // index = eye style sent by the phone
+const int MOOD_COUNT = sizeof(MOOD_ORDER) / sizeof(MOOD_ORDER[0]);
+int moodPick = 4;                     // Buddy: the 8-bit keychain-buddy face
 
 float openL = 1, openR = 1, openCur = 1.0;
 unsigned long nextBlink = 0, blinkStart = 0;
@@ -170,9 +177,63 @@ bool phoneCharging = false;
 int  soundVolume = 1;                 // 0 low, 1 medium, 2 high
 int  soundFlags = SF_DEFAULT;
 
-struct Note { uint16_t freq; uint16_t ms; };   // freq 0 = rest, ms 0 = end of tune
+// ---- ringtones for incoming calls (picked in the app, 5th field of the B command) ----
+// Notes stay between ~1 and 3 kHz, where a small passive buzzer is loudest. Each one
+// ends with a pause and loops until the call is answered, declined or missed.
+#define BELL     {2349, 30}, {1865, 30}            // one cycle of the bell trill
+#define BELL7    BELL, BELL, BELL, BELL, BELL, BELL, BELL
+#define MAR(f)   {f, 95}, {0, 15}                  // short marimba-style note
+#define E8(f)    {f, 115}, {0, 15}                 // eighth note with a tiny gap
+#define Q4(f)    {f, 245}, {0, 15}                 // quarter note
+#define S16(f)   {f, 125}, {0, 15}                 // sixteenth note (Fur Elise)
+#define ODE(f)   {f, 205}, {0, 25}
+
+// 0 Classic bell: old telephone trill
+const Note RING_BELL[] = { BELL7, BELL7, {0, 220}, BELL7, BELL7, {0, 1600}, {0, 0} };
+// 1 Gran Vals (Nokia-style): Tarrega, 1902, public domain
+const Note RING_GRANVALS[] = {
+  E8(2637), E8(2349), Q4(1480), Q4(1661),
+  E8(2217), E8(1976), Q4(1175), Q4(1319),
+  E8(1976), E8(1760), Q4(1109), Q4(1319),
+  {1760, 520}, {0, 1000}, {0, 0} };
+// 2 Marimba (iPhone-style): original bouncy arpeggios, C - F - G - C
+const Note RING_MARIMBA[] = {
+  MAR(1568), MAR(2093), MAR(2637), MAR(2093), MAR(1568), MAR(2093), MAR(2637), MAR(3136),
+  MAR(1397), MAR(1760), MAR(2093), MAR(1760), MAR(1397), MAR(1760), MAR(2093), MAR(2794),
+  MAR(1568), MAR(1976), MAR(2349), MAR(1976), MAR(1568), MAR(1976), MAR(2349), MAR(3136),
+  {2093, 250}, {0, 20}, {1568, 110}, {0, 10}, {2093, 330}, {0, 900}, {0, 0} };
+// 3 Digital: four beeps at the buzzer's loudest pitch
+const Note RING_DIGITAL[] = { {2730, 110}, {0, 60}, {2730, 110}, {0, 60}, {2730, 110}, {0, 60},
+                              {2730, 110}, {0, 900}, {0, 0} };
+// 4 Fur Elise: Beethoven, public domain
+const Note RING_ELISE[] = {
+  S16(2637), S16(2489), S16(2637), S16(2489), S16(2637), S16(1976), S16(2349), S16(2093),
+  {1760, 420}, {0, 140}, S16(1047), S16(1319), S16(1760), {1976, 420}, {0, 140},
+  S16(1319), S16(1661), S16(1976), {2093, 420}, {0, 1000}, {0, 0} };
+// 5 Westminster chime: clock-tower quarters, public domain
+const Note RING_CHIME[] = {
+  {1661, 300}, {0, 30}, {1480, 300}, {0, 30}, {1319, 300}, {0, 30}, {988, 650}, {0, 200},
+  {1319, 300}, {0, 30}, {1661, 300}, {0, 30}, {1480, 300}, {0, 30}, {988, 650}, {0, 1200}, {0, 0} };
+// 6 Arcade: original rising runs
+const Note RING_ARCADE[] = {
+  {1047, 45}, {1319, 45}, {1568, 45}, {2093, 45}, {0, 30},
+  {1319, 45}, {1568, 45}, {2093, 45}, {2637, 45}, {0, 30},
+  {1568, 45}, {2093, 45}, {2637, 45}, {3136, 90}, {0, 160},
+  {1047, 45}, {1319, 45}, {1568, 45}, {2093, 45}, {0, 30},
+  {1319, 45}, {1568, 45}, {2093, 45}, {2637, 45}, {0, 30},
+  {1568, 45}, {2093, 45}, {2637, 45}, {3136, 90}, {0, 800}, {0, 0} };
+// 7 Ode to Joy: Beethoven, public domain
+const Note RING_ODE[] = {
+  ODE(2637), ODE(2637), ODE(2794), ODE(3136), ODE(3136), ODE(2794), ODE(2637), ODE(2349),
+  ODE(2093), ODE(2093), ODE(2349), ODE(2637), {2637, 320}, {0, 25}, {2349, 100}, {0, 15},
+  {2349, 460}, {0, 900}, {0, 0} };
+
+const Note* const RINGTONES[] = { RING_BELL, RING_GRANVALS, RING_MARIMBA, RING_DIGITAL,
+                                  RING_ELISE, RING_CHIME, RING_ARCADE, RING_ODE };
+const int RING_COUNT = sizeof(RINGTONES) / sizeof(RINGTONES[0]);
+int ringtone = 0;
+
 const Note TUNE_NOTIFY[]   = { {1568, 70}, {0, 40}, {2093, 110}, {0, 0} };
-const Note TUNE_CALL[]     = { {1760, 120}, {1397, 120}, {1760, 120}, {1397, 120}, {0, 900}, {0, 0} };
 const Note TUNE_WATER[]    = { {1047, 110}, {1319, 110}, {1568, 110}, {2093, 220}, {0, 0} };
 const Note TUNE_FIND[]     = { {2637, 90}, {0, 60}, {2637, 90}, {0, 60}, {2637, 90}, {0, 450}, {0, 0} };
 const Note TUNE_HAPPY[]    = { {1319, 60}, {1568, 60}, {2093, 90}, {0, 0} };
@@ -183,7 +244,8 @@ const Note TUNE_BIRTHDAY[] = { {1047, 180}, {1047, 90}, {1175, 270}, {1047, 270}
                                {1047, 180}, {1047, 90}, {1175, 270}, {1047, 270}, {1568, 270}, {1397, 540},
                                {0, 0} };
 
-const Note* const TUNES[SND_COUNT] = { TUNE_NOTIFY, TUNE_CALL, TUNE_WATER, TUNE_FIND,
+// SND_CALL plays the chosen ringtone (see tuneFor)
+const Note* const TUNES[SND_COUNT] = { TUNE_NOTIFY, RING_BELL, TUNE_WATER, TUNE_FIND,
                                        TUNE_HAPPY, TUNE_CLICK, TUNE_BOOT, TUNE_BIRTHDAY };
 const int SOUND_FLAG[SND_COUNT]    = { SF_NOTIFY, SF_CALL, SF_WATER, SF_FIND,
                                        SF_TOUCH, SF_TOUCH, SF_BOOT, SF_BIRTHDAY };
@@ -202,10 +264,18 @@ const uint32_t VOLUME_DUTY[3] = { 48, 160, 512 };
   #define BUZZ_TARGET BUZZ_CHANNEL     // core 2.x: LEDC calls take a channel
 #endif
 
-const Note* tune = nullptr;
-int tuneIdx = 0;
-unsigned long noteEnd = 0;
-unsigned long tuneStopAt = 0;         // repeat the tune until then (0 = play once)
+// ---- player: runs in its own FreeRTOS task so note timing stays exact while
+//      loop() is busy drawing the screen. loop() only posts requests. ----
+const unsigned long REPEAT_FOREVER = 0xFFFFFFFFUL;   // loop until stopSound()
+portMUX_TYPE soundMux = portMUX_INITIALIZER_UNLOCKED;
+TaskHandle_t soundTaskHandle = nullptr;
+const Note* reqTune = nullptr;        // request from loop() to the sound task
+int reqId = -1;
+unsigned long reqRepeatMs = 0;
+bool reqPending = false;
+volatile int playingId = -1;          // sound being played (-1 = silent)
+
+void soundTask(void*);
 
 void buzzerBegin() {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -218,6 +288,7 @@ void buzzerBegin() {
 #if BUZZER_DIRECT
   gpio_set_drive_capability((gpio_num_t)BUZZER_PIN, GPIO_DRIVE_CAP_0);
 #endif
+  xTaskCreate(soundTask, "sound", 3072, nullptr, 2, &soundTaskHandle);
 }
 
 void buzzerTone(uint16_t freq) {
@@ -226,18 +297,70 @@ void buzzerTone(uint16_t freq) {
   ledcWrite(BUZZ_TARGET, VOLUME_DUTY[soundVolume]);
 }
 
-void stopSound() {
-  tune = nullptr;
-  tuneStopAt = 0;
-  buzzerTone(0);
+// hand a tune to the sound task (nullptr = silence); it starts right away
+void requestTune(int id, const Note* t, unsigned long repeatMs) {
+  portENTER_CRITICAL(&soundMux);
+  reqTune = t;
+  reqId = id;
+  reqRepeatMs = repeatMs;
+  reqPending = true;
+  portEXIT_CRITICAL(&soundMux);
+  if (soundTaskHandle) xTaskNotifyGive(soundTaskHandle);
 }
 
-bool isPlaying(int id) { return tune == TUNES[id]; }
+void soundTask(void*) {
+  const Note* t = nullptr;
+  int idx = 0;
+  bool repeat = false, forever = false;
+  unsigned long until = 0;
 
-void startNote(unsigned long now) {
-  buzzerTone(tune[tuneIdx].freq);
-  noteEnd = now + tune[tuneIdx].ms;
+  for (;;) {
+    bool fresh = false;
+    int id = -1;
+    unsigned long repeatMs = 0;
+    portENTER_CRITICAL(&soundMux);
+    if (reqPending) {
+      t = reqTune; id = reqId; repeatMs = reqRepeatMs;
+      reqPending = false;
+      fresh = true;
+    }
+    portEXIT_CRITICAL(&soundMux);
+
+    if (fresh) {
+      idx = 0;
+      repeat = repeatMs != 0;
+      forever = repeatMs == REPEAT_FOREVER;
+      until = millis() + (forever ? 0 : repeatMs);
+      playingId = t ? id : -1;
+    }
+
+    if (t == nullptr) {
+      buzzerTone(0);
+      playingId = -1;
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);    // sleep until the next request
+      continue;
+    }
+
+    if (t[idx].ms == 0) {                         // end of the tune
+      if (repeat && (forever || (long)(millis() - until) < 0)) idx = 0;
+      else t = nullptr;
+      continue;
+    }
+
+    buzzerTone(t[idx].freq);
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(t[idx].ms));   // wakes early on a new request
+    idx++;
+  }
 }
+
+const Note* tuneFor(int id) {
+  if (id == SND_CALL) return RINGTONES[ringtone];
+  return TUNES[id];
+}
+
+void stopSound() { requestTune(-1, nullptr, 0); }
+
+bool isPlaying(int id) { return playingId == id; }
 
 bool soundAllowed(int id) {
   if (!(soundFlags & SOUND_FLAG[id])) return false;
@@ -248,32 +371,24 @@ bool soundAllowed(int id) {
     if ((long)(millis() - muteUntil) < 0) return false;
     muteTimed = false;                            // mute time is over
   }
+  if (id == SND_CALL) return true;                // the phone is ringing: ring at any hour
   if (isSleepHours()) return false;
   if ((soundFlags & SF_QUIET_OFF_HOURS) && !activeHours()) return false;
   return true;
 }
 
-// repeatMs > 0 loops the tune for that long; preview (from the app) ignores the settings
+// repeatMs: 0 = once, REPEAT_FOREVER = until stopSound(); preview (from the app)
+// ignores the settings
 void playSound(int id, unsigned long repeatMs, bool preview) {
   if (id < 0 || id >= SND_COUNT) return;
   if (!preview && !soundAllowed(id)) return;
-  if (id == SND_CLICK && tune != nullptr) return;  // a click never cuts another sound
-  unsigned long now = millis();
-  tune = TUNES[id];
-  tuneIdx = 0;
-  tuneStopAt = repeatMs ? now + repeatMs : 0;
-  startNote(now);
+  if (id == SND_CLICK && playingId >= 0) return;  // a click never cuts another sound
+  requestTune(id, tuneFor(id), repeatMs);
 }
 
-// called every loop(); plays the next note without blocking the animations
-void updateSound(unsigned long now) {
-  if (tune == nullptr || (long)(now - noteEnd) < 0) return;
-  tuneIdx++;
-  if (tune[tuneIdx].ms == 0) {                    // end of the tune
-    if (tuneStopAt != 0 && (long)(now - tuneStopAt) < 0) tuneIdx = 0;
-    else { stopSound(); return; }
-  }
-  startNote(now);
+void previewRingtone(int n) {
+  if (n < 0 || n >= RING_COUNT) return;
+  requestTune(SND_CALL, RINGTONES[n], 0);
 }
 
 // ===============================================================
@@ -293,6 +408,8 @@ void loadSettings() {
   soundVolume = prefs.getInt("sv", 1);
   soundFlags  = prefs.getInt("sf", SF_DEFAULT);
   if (soundVolume < 0 || soundVolume > 2) soundVolume = 1;
+  ringtone    = prefs.getInt("rt", 0);
+  if (ringtone < 0 || ringtone >= RING_COUNT) ringtone = 0;
   applyWater();
 }
 
@@ -305,6 +422,7 @@ void saveSettings() {
   if (prefs.getBool("so", !soundOn) != soundOn) prefs.putBool("so", soundOn);
   if (prefs.getInt("sv", -1) != soundVolume) prefs.putInt("sv", soundVolume);
   if (prefs.getInt("sf", -1) != soundFlags) prefs.putInt("sf", soundFlags);
+  if (prefs.getInt("rt", -1) != ringtone) prefs.putInt("rt", ringtone);
 }
 
 void drawHeart(int cx, int cy, int s) {
@@ -530,6 +648,7 @@ void drawEye(int cx, int cy, float open, int m, bool isLeft) {
   int W = 34, H = 38, r = 10;
   if (m == SURPRISED) { W = 32; H = 42; r = 16; }
   if (m == TIRED)     { H = 26; r = 8; }
+  if (m == BUDDY)     { W = 40; H = 22; r = 10; }   // wide, glowing 8-bit eyes
   int curH = (int)(H * open); if (curH < 3) curH = 3;
   int x = cx - W / 2, y = cy - curH / 2;
   int rr = min(r, curH / 2);
@@ -544,6 +663,13 @@ void drawEye(int cx, int cy, float open, int m, bool isLeft) {
     display.fillRect(x - 1, y - 1, W + 2, (int)(curH * 0.42), SSD1306_BLACK);
     if (isLeft) display.fillTriangle(x, y, x + 12, y, x, y + 12, SSD1306_BLACK);
     else        display.fillTriangle(x + W, y, x + W - 12, y, x + W, y + 12, SSD1306_BLACK);
+  } else if (m == BUDDY) {
+    // sharp "cool" brow cut sloping down toward the middle
+    int cut = curH * 6 / 10;
+    if (isLeft) display.fillTriangle(x - 1, y - 1, x + W + 1, y - 1, x + W + 1, y + cut, SSD1306_BLACK);
+    else        display.fillTriangle(x - 1, y - 1, x + W + 1, y - 1, x - 1, y + cut, SSD1306_BLACK);
+    // one-pixel-art shine near the outer top corner
+    display.fillRect(isLeft ? x + 5 : x + W - 9, y + 4, 4, 3, SSD1306_BLACK);
   }
 }
 
@@ -630,6 +756,13 @@ void updateEyes(unsigned long now) {
   int cy = 32 + (int)lookY;
   drawEye(36 + (int)lookX + cross, cy, openL, mood, true);
   drawEye(92 + (int)lookX - cross, cy, openR, mood, false);
+  if (mood == BUDDY) {                       // tiny "^" mouth
+    int mx = 64 + (int)lookX, my = cy + 18;
+    display.drawLine(mx - 4, my + 3, mx, my - 1, SSD1306_WHITE);
+    display.drawLine(mx, my - 1, mx + 4, my + 3, SSD1306_WHITE);
+    display.drawLine(mx - 4, my + 4, mx, my, SSD1306_WHITE);
+    display.drawLine(mx, my, mx + 4, my + 4, SSD1306_WHITE);
+  }
   if (heart) { int s = 4 + (int)(2 * sin((now % 600) / 600.0 * 6.28)); drawHeart(64, 14, s); }
   phoneBadge();
   display.display();
@@ -806,7 +939,7 @@ bool showNotify(unsigned long now) {
   display.print(who);
 
   display.display();
-  return el > (notifyIsCall ? 20000UL : 5000UL);   // 5 s (calls: while ringing), then back
+  return !notifyIsCall && el > 5000;           // 5 s; a call stays until it ends (endCall)
 }
 
 // "find my Nano": big surprised eyes, flashing screen
@@ -855,13 +988,22 @@ Mode homeMode() {
   return (musicState == "PLAYING") ? MUSIC : EYES;
 }
 
+// the call was answered, declined, missed or silenced: stop ringing, close the call screen
+void endCall() {
+  if (!callActive) return;
+  callActive = false;
+  if (isPlaying(SND_CALL)) stopSound();
+  if (mode == NOTIFY && notifyIsCall) mode = homeMode();
+  notifyIsCall = false;
+}
+
 // Music only takes over idle screens, never a notification or reminder.
 bool canShowMusic() {
   return mode == EYES || mode == CLOCK || mode == MUSIC;
 }
 
 void setEyeStyle(int pick) {
-  if (pick < 0 || pick > 3) return;
+  if (pick < 0 || pick >= MOOD_COUNT) return;
   moodPick = pick;
   activeMood = MOOD_ORDER[pick];
 }
@@ -887,6 +1029,7 @@ void handleCommand(String c) {
     if (utc > 1577836800L) setClock(utc, tz);
 
   } else if (type == 'N' || type == 'R') {        // N|App|sender (5 s)   R|App|caller = incoming call
+    if (type == 'N' && callActive) return;        // keep showing the ringing call
     rest = asciiOnly(rest);
     int bar = rest.indexOf('|');
     if (bar >= 0) { notifyApp = rest.substring(0, bar); notifyFrom = rest.substring(bar + 1); }
@@ -895,12 +1038,20 @@ void handleCommand(String c) {
     notifyFrom = notifyFrom.substring(0, 40);
     notifyIsCall = (type == 'R');
     mode = NOTIFY; modeStart = millis(); pendingTap = false;
-    if (type == 'R') playSound(SND_CALL, 20000, false);     // ring until tapped or 20 s
-    else if (!isPlaying(SND_CALL)) playSound(SND_NOTIFY, 0, false);
+    if (type == 'R') {
+      // Rings until the phone says the call was answered, declined or missed (Q),
+      // or Nano is tapped. Another R while ringing only updates the caller name.
+      if (!callActive) {
+        callActive = true;
+        callStart = millis();
+        playSound(SND_CALL, REPEAT_FOREVER, false);
+      }
+    } else {
+      playSound(SND_NOTIFY, 0, false);
+    }
 
-  } else if (type == 'Q') {                       // call answered/ended: stop ringing
-    if (isPlaying(SND_CALL)) stopSound();
-    if (mode == NOTIFY && notifyIsCall) mode = homeMode();   // call screen goes too
+  } else if (type == 'Q') {                       // call answered/declined/ended: stop ringing
+    endCall();
 
   } else if (type == 'Z') {                       // Z|minutes: mute for a while (0 = unmute)
     long minutes = rest.toInt();
@@ -918,9 +1069,9 @@ void handleCommand(String c) {
     if (phoneBattery > 100) phoneBattery = 100;
     phoneCharging = bar >= 0 && rest.substring(bar + 1).toInt() != 0;
 
-  } else if (type == 'B') {                       // B|on|volume 0-2|flags
-    String parts[3]; int n = 0; String r = rest;
-    while (n < 3) {
+  } else if (type == 'B') {                       // B|on|volume 0-2|flags|ringtone
+    String parts[4]; int n = 0; String r = rest;
+    while (n < 4) {
       int b = r.indexOf('|');
       if (b < 0) { parts[n++] = r; break; }
       parts[n++] = r.substring(0, b);
@@ -929,11 +1080,14 @@ void handleCommand(String c) {
     if (n >= 1 && parts[0].length()) soundOn = parts[0].toInt() != 0;
     if (n >= 2) { int v = parts[1].toInt(); if (v >= 0 && v <= 2) soundVolume = v; }
     if (n >= 3 && parts[2].length()) soundFlags = parts[2].toInt() & 0xFF;
+    if (n >= 4 && parts[3].length()) { int t = parts[3].toInt(); if (t >= 0 && t < RING_COUNT) ringtone = t; }
     if (!soundOn && !isPlaying(SND_FIND)) stopSound();
     saveSettings();
 
-  } else if (type == 'P') {                       // P|<sound id> preview from the app
-    if (rest.length()) playSound(rest.toInt(), 0, true);
+  } else if (type == 'P') {                       // P|<sound id> or P|r<ringtone> preview from the app
+    if (rest.startsWith("s")) { if (!callActive) stopSound(); }   // P|s: stop a preview
+    else if (rest.startsWith("r")) previewRingtone(rest.substring(1).toInt());
+    else if (rest.length()) playSound(rest.toInt(), 0, true);
 
   } else if (type == 'S') {                       // S|name|HH:MM|HH:MM|minutes
     String parts[4]; int n = 0; String r = asciiOnly(rest);
@@ -993,7 +1147,7 @@ void handleCommand(String c) {
 // ===============================================================
 void onSingleTap() { mode = CLOCK; modeStart = millis(); }
 void onDoubleTap() {
-  setEyeStyle((moodPick + 1) % 4);
+  setEyeStyle((moodPick + 1) % MOOD_COUNT);
   sendToPhone(String("E|") + moodPick);           // keep the app's picker in sync
 }
 
@@ -1007,15 +1161,16 @@ void loop() {
     handleCommand(c);
   }
   now = millis();                                // commands may have taken a moment
-  updateSound(now);
 
   // phone went away: its music info is stale now
   bool connectedNow = phoneConnected;
   if (wasConnected && !connectedNow) {
+    endCall();                                   // can't hear "call ended" any more
     musicState = "STOPPED";
     if (mode == MUSIC) mode = EYES;
   }
   wasConnected = connectedNow;
+  if (callActive && (long)(now - callStart) > (long)CALL_MAX_MS) endCall();
 
   bool touch = digitalRead(TOUCH_PIN);
   bool rising = (touch && !lastTouch);
@@ -1046,25 +1201,31 @@ void loop() {
 
   // ---- taps register on release of a SHORT press ----
   if (falling && (now - pressStart < HOLD_MS) && !musicLongTriggered) {
-    // a tap silences a ringing call or the find beeps; otherwise it clicks
-    if (isPlaying(SND_CALL) || isPlaying(SND_FIND)) stopSound();
-    else playSound(SND_CLICK, 0, false);
-    if (mode == MUSIC) {
-      if (pendingTap && (now - lastTapTime <= DOUBLE_TAP_MS)) {
-        pendingTap = false;
-        sendMediaControl("PREV");
-      } else {
-        pendingTap = true;
-        lastTapTime = now;
+    // a tap silences a ringing call (and closes it) or the find beeps; otherwise it clicks
+    if (callActive) {
+      endCall();
+      pendingTap = false;
+    } else {
+      if (isPlaying(SND_FIND)) stopSound();
+      else playSound(SND_CLICK, 0, false);
+
+      if (mode == MUSIC) {
+        if (pendingTap && (now - lastTapTime <= DOUBLE_TAP_MS)) {
+          pendingTap = false;
+          sendMediaControl("PREV");
+        } else {
+          pendingTap = true;
+          lastTapTime = now;
+        }
+      } else if (mode == WATER) {                   // tapped away = "I drank" -> phone counts it
+        lastWater = now; mode = homeMode(); pendingTap = false;
+        sendToPhone("H|WATER");
       }
-    } else if (mode == WATER) {                     // tapped away = "I drank" -> phone counts it
-      lastWater = now; mode = homeMode(); pendingTap = false;
-      sendToPhone("H|WATER");
-    }
-    else if (mode != EYES) { mode = homeMode(); pendingTap = false; }
-    else {
-      if (pendingTap && (now - lastTapTime <= DOUBLE_TAP_MS)) { pendingTap = false; onDoubleTap(); }
-      else { pendingTap = true; lastTapTime = now; }
+      else if (mode != EYES) { mode = homeMode(); pendingTap = false; }
+      else {
+        if (pendingTap && (now - lastTapTime <= DOUBLE_TAP_MS)) { pendingTap = false; onDoubleTap(); }
+        else { pendingTap = true; lastTapTime = now; }
+      }
     }
   }
   if (falling) musicLongTriggered = false;
@@ -1089,7 +1250,7 @@ void loop() {
   if (isBirthday()) {
     static int tunePlayedDay = -1;                // sing once per birthday
     struct tm ti;
-    if (getNow(ti) && ti.tm_yday != tunePlayedDay && soundAllowed(SND_BIRTHDAY) && tune == nullptr) {
+    if (getNow(ti) && ti.tm_yday != tunePlayedDay && soundAllowed(SND_BIRTHDAY) && playingId < 0) {
       tunePlayedDay = ti.tm_yday;                 // waits until sound is allowed (not at midnight)
       playSound(SND_BIRTHDAY, 0, false);
     }
