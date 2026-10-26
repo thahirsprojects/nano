@@ -3,13 +3,16 @@
 //  Developed by Mohamed Thahir - https://github.com/thahirsprojects
 //  Android app: https://github.com/thahirsprojects/nano-companion-android
 //  - No Wi-Fi needed. The phone talks to Nano over Bluetooth LE.
-//  - Daytime cute eyes, evening tired eyes, night sleep ("Zzz")
-//  - ONE TAP    : clock ("Assalamu Alaikum" style clock + date)
-//  - DOUBLE TAP : change the eye style
-//  - HOLD       : pet Nano -> happy eyes, hearts, cute words
-//  - Idle fun   : occasional wink / yawn / heart / cross-eye / roll
-//  - Every N min: "DRINK WATER" animation (20 s)
-//  - 26 Nov     : birthday mode all day
+//  - Daytime cute eyes, evening tired eyes, night sleep ("Zzz"), auto-dimmed at night
+//  - ONE TAP      : clock (on the clock screen: battery, date)
+//  - DOUBLE TAP   : change the eye style
+//  - HOLD         : pet Nano -> happy eyes, hearts, cute words
+//  - HOLD LONGER  : (from the eyes) toggle local mute, no phone needed
+//  - HOLD (clock) : torch -- fills the screen white as a tiny flashlight
+//  - Idle fun     : occasional wink / yawn / heart / cross-eye / roll
+//  - Every N min  : "DRINK WATER" animation (20 s)
+//  - 26 Nov       : birthday mode all day
+//  - A dead OLED still sounds an SOS beep pattern so a fault is never silent
 //
 //  PHONE -> NANO COMMANDS (write text to the one BLE characteristic):
 //    T|<utc epoch seconds>|<tz offset seconds>    set the clock
@@ -17,7 +20,7 @@
 //    S|name|HH:MM start|HH:MM end|water minutes  change settings
 //    M|title|artist|PLAYING/PAUSED/STOPPED        music metadata
 //    W                                            test the water screen
-//    E|<0-4>                                      eye style (normal/happy/surprised/angry/buddy)
+//    E|<0-7>                                      eye style, see MOOD_ORDER
 //    F                                            find me: flash the screen
 //    R|App|caller                                 incoming call: rings until Q or a tap
 //    Q                                            call answered, declined or missed: stop ringing
@@ -26,10 +29,14 @@
 //    Z|<minutes>                                  mute sounds for a while (0 = unmute)
 //    D|0/1                                        phone Do Not Disturb (quiet while on)
 //    L|<percent>|<charging 0/1>                   phone battery on the clock screen (-1 hides)
+//    X|<minutes>                                  start a focus/countdown timer (0 cancels)
 //  NANO -> PHONE (BLE notify on the same characteristic):
 //    C|NEXT, C|PREV, C|PLAYPAUSE                  music controls
 //    H|WATER                                      water reminder tapped away
-//    E|<0-4>                                      eye style changed by double tap
+//    E|<0-7>                                      eye style changed by double tap
+//
+//  EYE STYLES (E|n / MOOD_ORDER): 0 Normal 1 Happy 2 Wow 3 Angry 4 Buddy
+//                                 5 Grin 6 Robot 7 Drowsy
 //
 //  WIRING:
 //    OLED VCC->3V3 GND->GND SCK->P22 SDA->P21
@@ -81,7 +88,7 @@ const unsigned long HOLD_MS       = 600;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 Preferences prefs;
 
-enum Mode { EYES, CLOCK, WATER, NOTIFY, MUSIC, FIND };
+enum Mode { EYES, CLOCK, WATER, NOTIFY, MUSIC, FIND, TIMER };
 Mode mode = EYES;
 unsigned long modeStart = 0;
 
@@ -102,11 +109,13 @@ String musicTitle = "", musicArtist = "", musicState = "STOPPED";
 unsigned long musicPausedAt = 0;
 const unsigned long MUSIC_PAUSE_TIMEOUT_MS = 30000;   // paused music screen -> eyes
 const unsigned long FIND_MS = 8000;
+unsigned long timerTotalMs = 0;   // focus/countdown timer length (X command)
 
-enum Mood { NORMAL, HAPPY, ANGRY, SURPRISED, TIRED, SLEEP, BUDDY };
+enum Mood { NORMAL, HAPPY, ANGRY, SURPRISED, TIRED, SLEEP, BUDDY, GRIN, ROBOT, DROWSY };
 int mood = NORMAL;
 int activeMood = BUDDY;             // cute-hours expression; double tap changes it
-const int MOOD_ORDER[] = { NORMAL, HAPPY, SURPRISED, ANGRY, BUDDY };   // index = eye style sent by the phone
+// index = eye style sent by the phone (E command / app picker)
+const int MOOD_ORDER[] = { NORMAL, HAPPY, SURPRISED, ANGRY, BUDDY, GRIN, ROBOT, DROWSY };
 const int MOOD_COUNT = sizeof(MOOD_ORDER) / sizeof(MOOD_ORDER[0]);
 int moodPick = 4;                     // Buddy: the 8-bit keychain-buddy face
 
@@ -125,6 +134,14 @@ float rollAngle = 0;
 bool lastTouch = false, pendingTap = false, petActive = false;
 unsigned long lastTapTime = 0, pressStart = 0, petWordNext = 0;
 String petWord = "";
+
+// Holding past the pet threshold toggles mute, without touching the phone.
+const unsigned long MUTE_HOLD_MS = 2500;
+bool muteToggledThisPress = false;
+
+// Holding the clock screen turns it into a plain white "torch" screen.
+const unsigned long TORCH_HOLD_MS = 1200;
+bool torchActive = false;
 
 unsigned long lastWater = 0;
 
@@ -161,12 +178,13 @@ const int CUTE_N = sizeof(CUTE) / sizeof(CUTE[0]);
 #define BUZZER_DIRECT 1
 
 enum Sound { SND_NOTIFY, SND_CALL, SND_WATER, SND_FIND, SND_HAPPY, SND_CLICK,
-             SND_BOOT, SND_BIRTHDAY, SND_COUNT };
+             SND_BOOT, SND_BIRTHDAY, SND_TIMER, SND_ERROR, SND_COUNT };
 
 // sound setting flags (B command), one bit per kind of sound
 const int SF_NOTIFY = 1, SF_CALL = 2, SF_WATER = 4, SF_FIND = 8, SF_TOUCH = 16,
-          SF_BOOT = 32, SF_BIRTHDAY = 64, SF_QUIET_OFF_HOURS = 128;
-const int SF_DEFAULT = SF_NOTIFY | SF_CALL | SF_WATER | SF_FIND | SF_TOUCH | SF_BOOT | SF_BIRTHDAY;
+          SF_BOOT = 32, SF_BIRTHDAY = 64, SF_QUIET_OFF_HOURS = 128, SF_TIMER = 256;
+const int SF_DEFAULT = SF_NOTIFY | SF_CALL | SF_WATER | SF_FIND | SF_TOUCH | SF_BOOT | SF_BIRTHDAY | SF_TIMER;
+const int SF_MASK = 0x1FF;   // every flag bit above, for sanitizing the B command
 
 bool soundOn = true;
 bool phoneDnd = false;                // phone is in Do Not Disturb (D command)
@@ -243,12 +261,20 @@ const Note TUNE_BIRTHDAY[] = { {1047, 180}, {1047, 90}, {1175, 270}, {1047, 270}
                                {0, 120},
                                {1047, 180}, {1047, 90}, {1175, 270}, {1047, 270}, {1568, 270}, {1397, 540},
                                {0, 0} };
+// Focus-timer "time's up" chime
+const Note TUNE_TIMER[]    = { {1976, 140}, {0, 60}, {2349, 140}, {0, 60}, {2793, 240}, {0, 900}, {0, 0} };
+// Low, flat, unmistakably "something is wrong" pattern -- plays even if the
+// screen has failed, so a dead OLED is not mistaken for a dead board.
+const Note TUNE_ERROR[]    = { {1200, 120}, {0, 120}, {1200, 120}, {0, 120}, {1200, 120}, {0, 900}, {0, 0} };
 
 // SND_CALL plays the chosen ringtone (see tuneFor)
 const Note* const TUNES[SND_COUNT] = { TUNE_NOTIFY, RING_BELL, TUNE_WATER, TUNE_FIND,
-                                       TUNE_HAPPY, TUNE_CLICK, TUNE_BOOT, TUNE_BIRTHDAY };
+                                       TUNE_HAPPY, TUNE_CLICK, TUNE_BOOT, TUNE_BIRTHDAY,
+                                       TUNE_TIMER, TUNE_ERROR };
+// SND_ERROR bypasses this entirely (see soundAllowed); the flag here is unused.
 const int SOUND_FLAG[SND_COUNT]    = { SF_NOTIFY, SF_CALL, SF_WATER, SF_FIND,
-                                       SF_TOUCH, SF_TOUCH, SF_BOOT, SF_BIRTHDAY };
+                                       SF_TOUCH, SF_TOUCH, SF_BOOT, SF_BIRTHDAY,
+                                       SF_TIMER, SF_FIND };
 
 // PWM duty (10-bit) per volume; a passive buzzer is loudest at 50 % (512)
 #if BUZZER_DIRECT
@@ -363,6 +389,7 @@ void stopSound() { requestTune(-1, nullptr, 0); }
 bool isPlaying(int id) { return playingId == id; }
 
 bool soundAllowed(int id) {
+  if (id == SND_ERROR) return true;               // a hardware fault always gets signalled
   if (!(soundFlags & SOUND_FLAG[id])) return false;
   if (id == SND_FIND) return true;                // finding Nano always beeps
   if (!soundOn) return false;
@@ -394,8 +421,13 @@ void previewRingtone(int n) {
 // ===============================================================
 void applyWater() { waterIntervalMs = (unsigned long)waterMin * 60000UL; }
 
+bool prefsOk = false;   // false = flash storage unavailable; run on in-memory defaults
+
 void loadSettings() {
-  prefs.begin("nano", false);
+  prefsOk = prefs.begin("nano", false);
+  if (!prefsOk) {
+    Serial.println("Preferences (NVS) unavailable; settings will not be saved this session.");
+  }
   buddyName = prefs.getString("name", "Nano");
   actStart  = prefs.getInt("as", 9 * 60);
   actEnd    = prefs.getInt("ae", 17 * 60 + 30);
@@ -406,7 +438,7 @@ void loadSettings() {
   if (waterMin < 1 || waterMin > 240) waterMin = 20;
   soundOn     = prefs.getBool("so", true);
   soundVolume = prefs.getInt("sv", 1);
-  soundFlags  = prefs.getInt("sf", SF_DEFAULT);
+  soundFlags  = prefs.getInt("sf", SF_DEFAULT) & SF_MASK;
   if (soundVolume < 0 || soundVolume > 2) soundVolume = 1;
   ringtone    = prefs.getInt("rt", 0);
   if (ringtone < 0 || ringtone >= RING_COUNT) ringtone = 0;
@@ -415,6 +447,7 @@ void loadSettings() {
 
 // The phone resends settings on every connect; only write flash when they change.
 void saveSettings() {
+  if (!prefsOk) return;    // NVS failed to open; keep running on defaults, do not crash
   if (prefs.getString("name", "") != buddyName) prefs.putString("name", buddyName);
   if (prefs.getInt("as", -1) != actStart) prefs.putInt("as", actStart);
   if (prefs.getInt("ae", -1) != actEnd) prefs.putInt("ae", actEnd);
@@ -591,13 +624,16 @@ void setup() {
   randomSeed(esp_random());
   loadSettings();
 
+  // Start the buzzer before the screen, so a dead OLED can still be heard.
+  buzzerBegin();
+
   Wire.begin(21, 22);
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println("OLED not found!");
-    while (true) delay(1000);
+    Serial.println("OLED not found! Signalling the fault on the buzzer and stopping here.");
+    playSound(SND_ERROR, REPEAT_FOREVER, true);   // preview=true: plays regardless of settings
+    for (;;) delay(1000);                          // nothing more we can do without a screen
   }
   display.setTextColor(SSD1306_WHITE);
-  buzzerBegin();
   bootScreen();
 
   startBLE();
@@ -644,11 +680,17 @@ int parseHHMM(String s) {
 }
 
 // ===============================================================
+// Eye styles without a mouth read best alone (Normal/Happy/Wow/Angry/Drowsy are
+// icon-like glyphs); Buddy/Grin/Robot are paired with drawMouth() below so the
+// whole face reads as one character rather than two floating eyes.
 void drawEye(int cx, int cy, float open, int m, bool isLeft) {
   int W = 34, H = 38, r = 10;
   if (m == SURPRISED) { W = 32; H = 42; r = 16; }
   if (m == TIRED)     { H = 26; r = 8; }
   if (m == BUDDY)     { W = 40; H = 22; r = 10; }   // wide, glowing 8-bit eyes
+  if (m == GRIN)      { W = 32; H = 32; r = 10; }   // a touch shorter: room for a big smile
+  if (m == ROBOT)     { W = 26; H = 26; r = 4; }    // small, square, mechanical
+  if (m == DROWSY)    { H = 24; r = 8; }            // heavy lids, any time of day
   int curH = (int)(H * open); if (curH < 3) curH = 3;
   int x = cx - W / 2, y = cy - curH / 2;
   int rr = min(r, curH / 2);
@@ -659,7 +701,7 @@ void drawEye(int cx, int cy, float open, int m, bool isLeft) {
   } else if (m == ANGRY) {
     if (isLeft) display.fillTriangle(x, y, x + W, y, x + W, y + 14, SSD1306_BLACK);
     else        display.fillTriangle(x, y, x + W, y, x, y + 14, SSD1306_BLACK);
-  } else if (m == TIRED) {
+  } else if (m == TIRED || m == DROWSY) {
     display.fillRect(x - 1, y - 1, W + 2, (int)(curH * 0.42), SSD1306_BLACK);
     if (isLeft) display.fillTriangle(x, y, x + 12, y, x, y + 12, SSD1306_BLACK);
     else        display.fillTriangle(x + W, y, x + W - 12, y, x + W, y + 12, SSD1306_BLACK);
@@ -670,6 +712,34 @@ void drawEye(int cx, int cy, float open, int m, bool isLeft) {
     else        display.fillTriangle(x - 1, y - 1, x + W + 1, y - 1, x - 1, y + cut, SSD1306_BLACK);
     // one-pixel-art shine near the outer top corner
     display.fillRect(isLeft ? x + 5 : x + W - 9, y + 4, 4, 3, SSD1306_BLACK);
+  } else if (m == GRIN) {
+    // a bright sparkle near the top (a little excited, not angled like Buddy)
+    display.fillCircle(isLeft ? x + 8 : x + W - 8, y + 7, 2, SSD1306_BLACK);
+  } else if (m == ROBOT) {
+    // a single square "sensor" pupil, centred in the eye
+    display.fillRect(cx - 3, cy - 3, 6, 6, SSD1306_BLACK);
+  }
+}
+
+// Mouths for the styles that have one; called once after both eyes are drawn.
+void drawMouth(int m, int mx, int my) {
+  if (m == BUDDY) {
+    display.drawLine(mx - 4, my + 3, mx, my - 1, SSD1306_WHITE);
+    display.drawLine(mx, my - 1, mx + 4, my + 3, SSD1306_WHITE);
+    display.drawLine(mx - 4, my + 4, mx, my, SSD1306_WHITE);
+    display.drawLine(mx, my, mx + 4, my + 4, SSD1306_WHITE);
+  } else if (m == GRIN) {
+    // a wide open smile with two small "teeth" gaps
+    display.fillRoundRect(mx - 15, my - 3, 30, 11, 5, SSD1306_WHITE);
+    display.fillRoundRect(mx - 12, my, 24, 6, 3, SSD1306_BLACK);
+    display.fillRect(mx - 6, my, 2, 6, SSD1306_WHITE);
+    display.fillRect(mx + 4, my, 2, 6, SSD1306_WHITE);
+  } else if (m == ROBOT) {
+    // a flat speaker-grille bar
+    display.drawFastHLine(mx - 11, my, 22, SSD1306_WHITE);
+    display.drawFastVLine(mx - 11, my - 2, 4, SSD1306_WHITE);
+    display.drawFastVLine(mx,      my - 2, 4, SSD1306_WHITE);
+    display.drawFastVLine(mx + 11, my - 2, 4, SSD1306_WHITE);
   }
 }
 
@@ -679,6 +749,27 @@ void phoneBadge() {
   display.setTextSize(1);
   display.setCursor(40, 56);
   display.print("No Phone");
+}
+
+// a quiet "Muted" note, bottom-left, so a silent Nano doesn't look broken
+void statusBadge() {
+  bool muted = !soundOn || phoneDnd ||
+    (muteTimed && (long)(millis() - muteUntil) < 0);
+  if (!muted) return;
+  display.setTextSize(1);
+  display.setCursor(2, 56);
+  display.print("Muted");
+}
+
+// Slow, tiny, pseudo-random drift so the eyes and clock digits are not drawn
+// on the exact same OLED pixels for hours on end (reduces burn-in risk).
+int burnShiftX = 0, burnShiftY = 0;
+unsigned long nextBurnShift = 0;
+void updateBurnShift(unsigned long now) {
+  if (now < nextBurnShift) return;
+  nextBurnShift = now + 300000UL;   // a new offset every 5 minutes
+  burnShiftX = random(-2, 3);
+  burnShiftY = random(-1, 2);
 }
 
 void drawSleeping(unsigned long now) {
@@ -753,16 +844,14 @@ void updateEyes(unsigned long now) {
   if (special != SP_ROLL) { lookX += (lookTX - lookX) * 0.2; lookY += (lookTY - lookY) * 0.2; }
 
   display.clearDisplay();
-  int cy = 32 + (int)lookY;
-  drawEye(36 + (int)lookX + cross, cy, openL, mood, true);
-  drawEye(92 + (int)lookX - cross, cy, openR, mood, false);
-  if (mood == BUDDY) {                       // tiny "^" mouth
-    int mx = 64 + (int)lookX, my = cy + 18;
-    display.drawLine(mx - 4, my + 3, mx, my - 1, SSD1306_WHITE);
-    display.drawLine(mx, my - 1, mx + 4, my + 3, SSD1306_WHITE);
-    display.drawLine(mx - 4, my + 4, mx, my, SSD1306_WHITE);
-    display.drawLine(mx, my, mx + 4, my + 4, SSD1306_WHITE);
+  int cy = 32 + (int)lookY + burnShiftY;
+  int bx = (int)lookX + burnShiftX;
+  drawEye(36 + bx + cross, cy, openL, mood, true);
+  drawEye(92 + bx - cross, cy, openR, mood, false);
+  if (mood == BUDDY || mood == GRIN || mood == ROBOT) {
+    drawMouth(mood, 64 + bx, cy + 18);
   }
+  statusBadge();
   if (heart) { int s = 4 + (int)(2 * sin((now % 600) / 600.0 * 6.28)); drawHeart(64, 14, s); }
   phoneBadge();
   display.display();
@@ -793,7 +882,9 @@ void showClock() {
     strftime(hhmm, sizeof(hhmm), "%H:%M", &ti);
     strftime(date, sizeof(date), "%a %d %b", &ti);
   }
-  display.setTextSize(3); display.setCursor((128 - (int)strlen(hhmm) * 18) / 2, 16); display.print(hhmm);
+  display.setTextSize(3);
+  display.setCursor((128 - (int)strlen(hhmm) * 18) / 2 + burnShiftX, 16 + burnShiftY);
+  display.print(hhmm);
   display.setTextSize(1);
   if (ok) { display.setCursor((128 - (int)strlen(date) * 6) / 2, 46); display.print(date); }
   else { display.setCursor(4, 46); display.print("waiting for phone..."); }
@@ -801,6 +892,7 @@ void showClock() {
     String b = String("Phone ") + phoneBattery + "%" + (phoneCharging ? "+" : "");
     display.setCursor(128 - (int)b.length() * 6, 2); display.print(b);
   }
+  statusBadge();
   display.display();
 }
 
@@ -842,6 +934,37 @@ void showWater(unsigned long now) {
   display.fillRect(barX, 52, (int)(barW * (rem / (float)total)), 6, SSD1306_WHITE);
 
   display.display();
+}
+
+// focus/countdown timer: big MM:SS remaining + a shrinking bar underneath,
+// in the same style as the water screen. Returns true once time is up (the
+// caller plays the completion sound exactly once, outside this function).
+bool showTimer(unsigned long now) {
+  unsigned long el = modeElapsed(now);
+  display.clearDisplay();
+
+  long remMs = (long)timerTotalMs - (long)el;
+  if (remMs < 0) remMs = 0;
+  int remSec = remMs / 1000;
+
+  display.setTextSize(1);
+  const char* label = "FOCUS TIME";
+  display.setCursor((128 - (int)strlen(label) * 6) / 2, 10);
+  display.print(label);
+
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02d:%02d", remSec / 60, remSec % 60);
+  display.setTextSize(3);
+  display.setCursor((128 - (int)strlen(buf) * 18) / 2, 24);
+  display.print(buf);
+
+  float frac = timerTotalMs ? (remMs / (float)timerTotalMs) : 0;
+  int barX = 14, barW = 100;
+  display.drawRect(barX, 54, barW, 6, SSD1306_WHITE);
+  display.fillRect(barX, 54, (int)(barW * frac), 6, SSD1306_WHITE);
+
+  display.display();
+  return remMs <= 0;
 }
 
 // which app is this, in a tidy name?
@@ -1067,6 +1190,7 @@ void handleCommand(String c) {
     int bar = rest.indexOf('|');
     phoneBattery = (bar < 0 ? rest : rest.substring(0, bar)).toInt();
     if (phoneBattery > 100) phoneBattery = 100;
+    if (phoneBattery < -1) phoneBattery = -1;        // anything but a real % hides the reading
     phoneCharging = bar >= 0 && rest.substring(bar + 1).toInt() != 0;
 
   } else if (type == 'B') {                       // B|on|volume 0-2|flags|ringtone
@@ -1079,7 +1203,7 @@ void handleCommand(String c) {
     }
     if (n >= 1 && parts[0].length()) soundOn = parts[0].toInt() != 0;
     if (n >= 2) { int v = parts[1].toInt(); if (v >= 0 && v <= 2) soundVolume = v; }
-    if (n >= 3 && parts[2].length()) soundFlags = parts[2].toInt() & 0xFF;
+    if (n >= 3 && parts[2].length()) soundFlags = parts[2].toInt() & SF_MASK;
     if (n >= 4 && parts[3].length()) { int t = parts[3].toInt(); if (t >= 0 && t < RING_COUNT) ringtone = t; }
     if (!soundOn && !isPlaying(SND_FIND)) stopSound();
     saveSettings();
@@ -1141,6 +1265,19 @@ void handleCommand(String c) {
   } else if (type == 'F') {                       // find my Nano
     mode = FIND; modeStart = millis(); pendingTap = false;
     playSound(SND_FIND, FIND_MS, false);
+
+  } else if (type == 'X') {                       // X|minutes: focus/countdown timer, 0 cancels
+    long mins = rest.toInt();
+    if (mins <= 0) {
+      if (mode == TIMER) mode = homeMode();
+    } else {
+      if (mins > 180) mins = 180;                 // 3 h cap; a stuck timer should never run forever
+      timerTotalMs = (unsigned long)mins * 60000UL;
+      mode = TIMER; modeStart = millis(); pendingTap = false;
+    }
+
+  } else {
+    Serial.print("Unknown command type: '"); Serial.print(type); Serial.println("'");
   }
 }
 
@@ -1172,10 +1309,47 @@ void loop() {
   wasConnected = connectedNow;
   if (callActive && (long)(now - callStart) > (long)CALL_MAX_MS) endCall();
 
-  bool touch = digitalRead(TOUCH_PIN);
+  updateBurnShift(now);
+
+  // Softer screen at night, so Nano doesn't glow like a nightlight in a dark
+  // room; back to normal contrast the moment sleep hours end.
+  static bool displayDimmed = false;
+  bool wantDim = isSleepHours();
+  if (wantDim != displayDimmed) {
+    displayDimmed = wantDim;
+    display.dim(wantDim);
+  }
+
+  // Self-heal if the heap is getting dangerously fragmented from long uptime
+  // (lots of short-lived Strings). A clean restart is safer than an eventual
+  // crash; BLE simply re-advertises and the phone reconnects on its own.
+  static unsigned long nextHeapCheck = 0;
+  if (now >= nextHeapCheck) {
+    nextHeapCheck = now + 60000UL;
+    uint32_t freeHeap = ESP.getFreeHeap();
+    Serial.print("Free heap: "); Serial.println(freeHeap);
+    if (freeHeap < 12000) {
+      Serial.println("Heap critically low; restarting to recover.");
+      delay(50);
+      ESP.restart();
+    }
+  }
+
+  // Debounce the touch sensor: two consistent readings in a row (~60 ms)
+  // before trusting a state change, so electrical noise can't fake a tap.
+  static bool touchFiltered = false;
+  static uint8_t touchSame = 0;
+  bool touchRaw = digitalRead(TOUCH_PIN);
+  if (touchRaw == touchFiltered) {
+    touchSame = 0;
+  } else if (++touchSame >= 2) {
+    touchFiltered = touchRaw;
+    touchSame = 0;
+  }
+  bool touch = touchFiltered;
   bool rising = (touch && !lastTouch);
   bool falling = (!touch && lastTouch);
-  if (rising) pressStart = now;
+  if (rising) { pressStart = now; muteToggledThisPress = false; }
 
   // ---- MUSIC controls: hold = play/pause ----
   if (mode == MUSIC && touch && !musicLongTriggered &&
@@ -1185,7 +1359,24 @@ void loop() {
     sendMediaControl("PLAYPAUSE");
   }
 
-  // ---- HOLD = pet (only from the eyes screen) ----
+  // ---- HOLD on the clock = torch: fills the screen white, a little desk
+  //      flashlight. Capped at a minute even if a finger rests on it. ----
+  if (mode == CLOCK && touch && !torchActive && (now - pressStart >= TORCH_HOLD_MS)) {
+    torchActive = true; pendingTap = false;
+  }
+  if (torchActive) {
+    if (!touch || (now - pressStart) > TORCH_HOLD_MS + 60000UL) {
+      torchActive = false;
+    } else {
+      display.clearDisplay();
+      display.fillRect(0, 0, 128, 64, SSD1306_WHITE);
+      display.display();
+      lastTouch = touch; delay(30); return;
+    }
+  }
+
+  // ---- HOLD = pet (only from the eyes screen); keep holding past the pet
+  //      threshold to toggle Nano's local mute without needing the phone ----
   if (mode == EYES && touch && !petActive && (now - pressStart >= HOLD_MS)) {
     petActive = true; pendingTap = false;
     playSound(SND_HAPPY, 0, false);
@@ -1194,8 +1385,25 @@ void loop() {
   if (petActive) {
     if (!touch) { petActive = false; }           // let go -> back to eyes
     else {
-      if (now >= petWordNext) { petWord = CUTE[random(CUTE_N)]; petWordNext = now + 1500; }
-      showPet(now); lastTouch = touch; delay(30); return;
+      if (!muteToggledThisPress && (now - pressStart >= MUTE_HOLD_MS)) {
+        muteToggledThisPress = true;
+        soundOn = !soundOn;
+        saveSettings();
+        if (!soundOn) stopSound();
+        playSound(SND_CLICK, 0, true);            // feedback, bypassing the new mute state
+      }
+      if (muteToggledThisPress) {
+        display.clearDisplay();
+        display.setTextSize(2);
+        String msg = soundOn ? "UNMUTED" : "MUTED";
+        display.setCursor((128 - (int)msg.length() * 12) / 2, 24);
+        display.print(msg);
+        display.display();
+      } else {
+        if (now >= petWordNext) { petWord = CUTE[random(CUTE_N)]; petWordNext = now + 1500; }
+        showPet(now);
+      }
+      lastTouch = touch; delay(30); return;
     }
   }
 
@@ -1246,6 +1454,7 @@ void loop() {
   if (mode == WATER)  { showWater(now); if (modeElapsed(now) > 20000) { mode = homeMode(); lastWater = now; } delay(30); return; }
   if (mode == NOTIFY)     { if (showNotify(now)) mode = homeMode(); delay(30); return; }
   if (mode == FIND)       { if (showFind(now)) { setInverted(false); if (isPlaying(SND_FIND)) stopSound(); mode = homeMode(); } delay(30); return; }
+  if (mode == TIMER)      { if (showTimer(now)) { playSound(SND_TIMER, 0, false); mode = homeMode(); } delay(30); return; }
 
   if (isBirthday()) {
     static int tunePlayedDay = -1;                // sing once per birthday
